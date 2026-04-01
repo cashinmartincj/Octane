@@ -1,0 +1,155 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Octane</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+            background: #0a0a0a;
+            color: #e0e0e0;
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            overflow: hidden;
+        }
+
+        .bg {
+            position: fixed;
+            inset: 0;
+            background:
+                radial-gradient(ellipse at 20% 50%, rgba(255, 95, 31, 0.08) 0%, transparent 50%),
+                radial-gradient(ellipse at 80% 50%, rgba(255, 165, 0, 0.06) 0%, transparent 50%);
+        }
+
+        .container {
+            position: relative;
+            text-align: center;
+            padding: 3rem;
+        }
+
+        .logo {
+            font-size: 5rem;
+            font-weight: 800;
+            letter-spacing: -0.03em;
+            background: linear-gradient(135deg, #ff5f1f, #ff9500, #ffcc00);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            margin-bottom: 0.5rem;
+        }
+
+        .tagline {
+            font-size: 1.2rem;
+            color: #777;
+            margin-bottom: 3rem;
+            letter-spacing: 0.2em;
+            text-transform: uppercase;
+            font-weight: 300;
+        }
+
+        .stats {
+            display: flex;
+            gap: 3rem;
+            justify-content: center;
+            margin-bottom: 3rem;
+        }
+
+        .stat {
+            text-align: center;
+        }
+
+        .stat-value {
+            font-size: 2rem;
+            font-weight: 700;
+            color: #ff7b00;
+        }
+
+        .stat-label {
+            font-size: 0.75rem;
+            color: #555;
+            text-transform: uppercase;
+            letter-spacing: 0.15em;
+            margin-top: 0.25rem;
+        }
+
+        .code {
+            background: #111;
+            border: 1px solid #222;
+            border-radius: 12px;
+            padding: 2rem;
+            text-align: left;
+            display: inline-block;
+            font-family: 'JetBrains Mono', 'Fira Code', monospace;
+            font-size: 0.9rem;
+            line-height: 1.8;
+            margin-bottom: 2rem;
+        }
+
+        .kw { color: #ff7b00; }
+        .fn { color: #ffcc00; }
+        .str { color: #7ec699; }
+        .cmt { color: #444; }
+
+        .pulse {
+            width: 8px;
+            height: 8px;
+            background: #ff5f1f;
+            border-radius: 50%;
+            display: inline-block;
+            margin-right: 8px;
+            animation: pulse 2s infinite;
+        }
+
+        .status {
+            font-size: 0.85rem;
+            color: #555;
+        }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; box-shadow: 0 0 0 0 rgba(255, 95, 31, 0.4); }
+            50% { opacity: 0.7; box-shadow: 0 0 0 10px rgba(255, 95, 31, 0); }
+        }
+    </style>
+</head>
+<body>
+    <div class="bg"></div>
+    <div class="container">
+        <div class="logo">OCTANE</div>
+        <div class="tagline">C++ Web Framework &middot; Zero Copy &middot; Blazing Fast</div>
+
+        <div class="stats">
+            <div class="stat">
+                <div class="stat-value">0μs</div>
+                <div class="stat-label">Overhead</div>
+            </div>
+            <div class="stat">
+                <div class="stat-value">mmap</div>
+                <div class="stat-label">File Serving</div>
+            </div>
+            <div class="stat">
+                <div class="stat-value">C++23</div>
+                <div class="stat-label">Standard</div>
+            </div>
+        </div>
+
+        <div class="code">
+            <span class="cmt">// That's it. That's the server.</span><br>
+            <span class="kw">app</span>.<span class="fn">get</span>(<span class="str">"/"</span>, [](Request&amp; req, Response&amp; res) {<br>
+            &nbsp;&nbsp;&nbsp;&nbsp;res.<span class="fn">send</span>(<span class="str">"Hello from Octane!"</span>);<br>
+            });<br><br>
+            <span class="kw">app</span>.<span class="fn">listen</span>(<span class="str">8080</span>);
+        </div>
+
+        <br>
+
+        <div class="status">
+            <span class="pulse"></span>
+            Serving from memory-mapped file &middot; Port 8080
+        </div>
+    </div>
+</body>
+</html>
