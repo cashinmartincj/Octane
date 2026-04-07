@@ -1,34 +1,29 @@
 cmake_minimum_required(VERSION 3.20)
-project(octane CXX)
+project(octane)
 
-set(CMAKE_CXX_STANDARD 23)
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-find_package(asio QUIET)
+add_executable(octane
+    main.cpp
+    FileHandle.cpp
+)
 
-if(NOT asio_FOUND)
-    include(FetchContent)
-    FetchContent_Declare(asio
-        GIT_REPOSITORY https://github.com/chriskohlhoff/asio.git
-        GIT_TAG asio-1-30-2
-    )
-    FetchContent_MakeAvailable(asio)
-    set(ASIO_INCLUDE_DIR ${asio_SOURCE_DIR}/asio/include)
-endif()
+target_include_directories(octane PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
 
-add_executable(octane main.cpp FileHandle.cpp)
+# ── asio header only — no find_package needed ──
+target_compile_definitions(octane PRIVATE
+    ASIO_STANDALONE          # no boost dependency
+    _WIN32_WINNT=0x0601      # windows only — ignore on linux
+)
 
-option(OCTANE_DEV "Enable dev mode" OFF)
+# linux needs pthread
+target_link_libraries(octane PRIVATE pthread)
 
-if(OCTANE_DEV)
+# dev mode
+option(OCTANE_DEV_MODE "Enable live reload" OFF)
+if(OCTANE_DEV_MODE)
     target_compile_definitions(octane PRIVATE OCTANE_DEV_MODE)
 endif()
-
-file(COPY ${CMAKE_SOURCE_DIR}/index.html DESTINATION ${CMAKE_BINARY_DIR})
-
-if(ASIO_INCLUDE_DIR)
-    target_include_directories(octane PRIVATE ${ASIO_INCLUDE_DIR})
-endif()
-
-target_compile_definitions(octane PRIVATE ASIO_STANDALONE)

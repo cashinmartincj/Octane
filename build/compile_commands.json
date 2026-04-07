@@ -1,14 +1,14 @@
 [
 {
-  "directory": "/home/cashinmartincj/Documents/programing/networking/build",
-  "command": "/usr/bin/clang++ -DASIO_STANDALONE -DOCTANE_DEV_MODE -I/home/cashinmartincj/Documents/programing/networking/build/_deps/asio-src/asio/include -g -std=gnu++23 -o CMakeFiles/octane.dir/main.cpp.o -c /home/cashinmartincj/Documents/programing/networking/main.cpp",
-  "file": "/home/cashinmartincj/Documents/programing/networking/main.cpp",
+  "directory": "/home/cashinmartincj/Documents/coding/networking/build",
+  "command": "/usr/bin/c++ -DASIO_STANDALONE -I/home/cashinmartincj/Documents/coding/networking/build/_deps/asio-src/asio/include -std=gnu++23 -o CMakeFiles/octane.dir/main.cpp.o -c /home/cashinmartincj/Documents/coding/networking/main.cpp",
+  "file": "/home/cashinmartincj/Documents/coding/networking/main.cpp",
   "output": "CMakeFiles/octane.dir/main.cpp.o"
 },
 {
-  "directory": "/home/cashinmartincj/Documents/programing/networking/build",
-  "command": "/usr/bin/clang++ -DASIO_STANDALONE -DOCTANE_DEV_MODE -I/home/cashinmartincj/Documents/programing/networking/build/_deps/asio-src/asio/include -g -std=gnu++23 -o CMakeFiles/octane.dir/FileHandle.cpp.o -c /home/cashinmartincj/Documents/programing/networking/FileHandle.cpp",
-  "file": "/home/cashinmartincj/Documents/programing/networking/FileHandle.cpp",
+  "directory": "/home/cashinmartincj/Documents/coding/networking/build",
+  "command": "/usr/bin/c++ -DASIO_STANDALONE -I/home/cashinmartincj/Documents/coding/networking/build/_deps/asio-src/asio/include -std=gnu++23 -o CMakeFiles/octane.dir/FileHandle.cpp.o -c /home/cashinmartincj/Documents/coding/networking/FileHandle.cpp",
+  "file": "/home/cashinmartincj/Documents/coding/networking/FileHandle.cpp",
   "output": "CMakeFiles/octane.dir/FileHandle.cpp.o"
 }
 ]

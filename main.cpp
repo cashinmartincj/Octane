@@ -1,102 +1,69 @@
+// main.cpp
+#include "App.h"
+#include "RouteBase.h"
+#include <fstream>
+#include <string>
+#include <unordered_map>
 #include "FileHandle.h"
-#include <iostream>
-#include <asio.hpp>
 
-using asio::ip::tcp;
+class GetImage : public routes::Get<GetImage> {
+public:
+    void handle(const HttpRequest& req, HttpResponse& res) {
+        std::ifstream file("image.png", std::ios::binary);
+        if (!file.is_open())
+        {
+            res.status(404).text("image not found");
+            return ;
+        }
+        std::string data((std::istreambuf_iterator<char>(file)),
+                          std::istreambuf_iterator<char>());
 
-#ifdef OCTANE_DEV_MODE
-const std::string LIVE_RELOAD_SCRIPT =
-    "<script>"
-    "let last='';"
-    "setInterval(async()=>{"
-    "const r=await fetch('/__reload');"
-    "const t=await r.text();"
-    "if(last&&last!==t)location.reload();"
-    "last=t;"
-    "},500);"
-    "</script>";
-#endif
+        res.status(200).image(data, ContentType::IMAGE_PNG);
+    }
+};
 
-void handle(tcp::socket socket, std::string_view content) 
-{
-    char buf[4096];
-    asio::error_code ec;
-    std::size_t len = socket.read_some(asio::buffer(buf), ec);
-    if (ec) return;
+class GetHtml : public routes::Get<GetHtml> {
+public:
+    void handle(const HttpRequest& req, HttpResponse& res) {
+        std::string data = read_file("index.html");
+        res.status(200).html(std::move(data));
+    }
+};
 
-    std::string request(buf, len);
 
-    #ifdef OCTANE_DEV_MODE
-        if (request.find("/__reload") != std::string::npos) {
-            struct stat st;
-            stat("index.html", &st);
-            std::string mtime = std::to_string(st.st_mtime);
-            std::string response =
-                "HTTP/1.1 200 OK\r\n"
-                "Content-Length: " + std::to_string(mtime.size()) + "\r\n"
-                "\r\n" + mtime;
-            asio::write(socket, asio::buffer(response), ec);
+class GetValue : public routes::Get<GetValue> {
+public:
+    void handle(const HttpRequest& req, HttpResponse& res) {
+        static const std::unordered_map<int, int> memo{{1, 10}, {2, 20}, {3, 30}};
+        for (const auto& [name, value] : req.headers) {
+            std::cout << "Header: '" << name << "' = '" << value << "'\n";
+        }
+        res.status(200).json("{\"debug\":\"check console\"}");
+        std::string keyHeader = req.header("Key");
+
+        // Validate the header is present
+        if (keyHeader.empty()) {
+            res.status(400).json("{\"error\":\"Missing Key header\"}");
             return;
         }
 
-        std::string html(content);
-        auto pos = html.find("</body>");
-        if (pos != std::string::npos)
-            html.insert(pos, LIVE_RELOAD_SCRIPT);
+        int key = std::stoi(keyHeader); // consider wrapping in try/catch
+        auto it = memo.find(key);
 
-        std::string header =
-            "HTTP/1.1 200 OK\r\n"
-            "Content-Type: text/html\r\n"
-            "Content-Length: " + std::to_string(html.size()) + "\r\n"
-            "Connection: close\r\n"
-            "\r\n";
-
-        std::array<asio::const_buffer, 2> buffers = {
-            asio::buffer(header),
-            asio::buffer(html.data(), html.size())
-        };
-        asio::write(socket, buffers, ec);
-    #else
-        std::string header =
-            "HTTP/1.1 200 OK\r\n"
-            "Content-Type: text/html\r\n"
-            "Content-Length: " + std::to_string(content.size()) + "\r\n"
-            "Connection: close\r\n"
-            "\r\n";
-
-        std::array<asio::const_buffer, 2> buffers = {
-            asio::buffer(header),
-            asio::buffer(content.data(), content.size())
-        };
-        asio::write(socket, buffers, ec);
-    #endif
-}
-
-int main()
-{
-    asio::io_context io;
-    tcp::acceptor acceptor(io, tcp::endpoint(tcp::v4(), 8080));
-    std::cout << "OCTANE RUNNING ON PORT..." << std::endl;
-
-    #ifndef OCTANE_DEV_MODE
-        MappedFile html;
-        if (!html.open("index.html")) 
-        {
-            std::cerr << "Failed to open index.html\n";
-            return 1;
+        if (it == memo.end()) {
+            res.status(404).json("{\"error\":\"Key not found\"}");
+            return;
         }
-    #endif
 
-        while (true)
-        {
-            tcp::socket socket(io);
-            acceptor.accept(socket);
-            #ifdef OCTANE_DEV_MODE
-                std::string html = read_file("index.html");
-                handle(std::move(socket), html);
-            #else
-                handle(std::move(socket), html.view());
-            #endif
-        }
-    return 0;
+        std::string result = "{\"value\":" + std::to_string(it->second) + "}";
+        res.status(200).json(std::move(result));
+    }
+};
+
+int main() {
+    App app;
+    app.get<GetImage>("/image");
+    app.get<GetHtml>("/");
+    app.get<GetValue>("/value");
+    app.listen(8080);
 }
