@@ -36,7 +36,10 @@ inline const std::unordered_map<int, std::string> status_text_str = {
 struct HttpResponse {
     int         status_code  = 200;                      
     ContentType content_type = ContentType::TEXT_PLAIN;
-    std::string body;
+    std::string      owned_body;   // for dynamic responses (JSON etc)
+    std::string      body;
+    std::string_view mapped_body;  // for mmap responses (files)
+    bool             is_mapped = false;
     std::unordered_map<std::string, std::string> headers;
 
     // ── Setters — all chainable ──────────────────
@@ -48,20 +51,48 @@ struct HttpResponse {
     HttpResponse& image (const std::string& data, ContentType type) { body = data; content_type = type; return *this; }
     HttpResponse& header(const std::string& key, const std::string& val) { headers[key] = val; return *this; }
 
+    HttpResponse& html_view(std::string_view data) {
+        content_type = ContentType::TEXT_HTML;
+        mapped_body  = data;
+        body_type    = BodyType::Mapped;
+        return *this;
+    }
+
+    HttpResponse& image_view(std::string_view data, ContentType ct) {
+        content_type = ct;
+        mapped_body  = data;
+        body_type    = BodyType::Mapped;
+        return *this;
+    }
+
+    enum class BodyType { Dynamic, Owned, Mapped } body_type = BodyType::Dynamic;
+
+    std::string_view active_body() const {
+        switch (body_type) {
+            case BodyType::Dynamic: return std::string_view(body);
+            case BodyType::Owned:   return std::string_view(owned_body);
+            case BodyType::Mapped:  return mapped_body;
+            default:                return std::string_view(body);
+        }
+    }
+
     // ── Serialize ────────────────────────────────
     std::string serialize() const {
         // status text — fallback to "Unknown" if not in map
         auto sit = status_text_str.find(status_code);
         std::string stext = sit != status_text_str.end() ? sit->second : "Unknown";
+        auto body_ret = active_body();   // ← picks right one automatically
 
         std::string response;
         response += "HTTP/1.1 " + std::to_string(status_code) + " " + stext + "\r\n";  // ✅ status text
         response += "Content-Type: " + content_type_str.at(content_type) + "\r\n"; // ✅ map lookup
-        response += "Content-Length: " + std::to_string(body.size()) + "\r\n";
+        response += "Content-Length: " + std::to_string(body_ret.size()) + "\r\n";
+        response += "Connection: keep-alive\r\n";   // ← add here
+        response += "Keep-Alive: timeout=5\r\n";    // ← and this
         for (auto& [key, val] : headers)
             response += key + ": " + val + "\r\n";
         response += "\r\n";
-        response += body;
+        response += body_ret;
         return response;
     }
 };

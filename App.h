@@ -25,6 +25,8 @@ const std::string LIVE_RELOAD_SCRIPT =
 class App {
     Router           router_;
     asio::io_context io_;
+    tcp::acceptor acceptor_{io_};  // ← member, lives as long as App
+
 
 public:
     // ── CRTP style ───────────────────────────────
@@ -47,26 +49,29 @@ public:
 
     // ── Start server ─────────────────────────────
     void listen(int port, int threads = std::thread::hardware_concurrency()) {
-        tcp::acceptor acceptor(io_, tcp::endpoint(tcp::v4(), port));
-        std::cout << "Octane running on port " << port
-                  << " (" << threads << " threads)\n";
-        accept_next(acceptor);
+        auto work = asio::make_work_guard(io_);
+        acceptor_.open(tcp::v4());
+        acceptor_.set_option(tcp::acceptor::reuse_address(true));
+        acceptor_.bind(tcp::endpoint(tcp::v4(), port));
+        acceptor_.listen();
+
+        accept_next();  // ← no argument needed now
 
         std::vector<std::thread> pool;
         for (int i = 0; i < threads - 1; ++i)
             pool.emplace_back([this]{ io_.run(); });
-
         io_.run();
         for (auto& t : pool) t.join();
     }
     
 private:
     // ── Async accept loop ────────────────────────
-    void accept_next(tcp::acceptor& acceptor) {
+    void accept_next() {
         auto socket = std::make_shared<tcp::socket>(io_);
-        acceptor.async_accept(*socket, [this, &acceptor, socket](asio::error_code ec) {
+        acceptor_.async_accept(*socket, [this, socket](asio::error_code ec) {
+            if (ec == asio::error::operation_aborted) return;
             if (!ec) handle_connection(socket);
-            accept_next(acceptor);   // immediately ready for next connection
+            accept_next();   // ← no argument
         });
     }
 
@@ -108,7 +113,9 @@ private:
                 // 4. async write — don't block while sending
                 auto payload = std::make_shared<std::string>(res.serialize());
                 asio::async_write(*socket, asio::buffer(*payload),
-                    [socket, payload](asio::error_code, std::size_t) {
+                    [this, socket, payload](asio::error_code ec, std::size_t) {
+                        if (ec) return;
+                        handle_connection(socket);
                         // socket closes here automatically
                     });
             });

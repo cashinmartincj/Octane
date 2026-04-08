@@ -25,8 +25,13 @@ public:
 class GetHtml : public routes::Get<GetHtml> {
 public:
     void handle(const HttpRequest& req, HttpResponse& res) {
-        std::string data = read_file("index.html");
-        res.status(200).html(std::move(data));
+        static auto file = [](){
+        auto f = std::make_unique<MappedFile>();
+            f->open("index.html");
+            return f;   // ← unique_ptr is moveable, not copyable — works fine
+        }();
+
+        res.status(200).html_view(file->view());  // ← zero copy
     }
 };
 
