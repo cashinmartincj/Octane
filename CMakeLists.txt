@@ -9,6 +9,8 @@ add_executable(octane
     FileHandle.cpp
 )
 
+configure_file(index.html ${CMAKE_CURRENT_BINARY_DIR}/index.html COPYONLY)
+
 target_include_directories(octane PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
 )

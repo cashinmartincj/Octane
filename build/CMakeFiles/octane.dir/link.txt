@@ -1,1 +1,0 @@
-/usr/bin/c++ -Wl,--dependency-file=CMakeFiles/octane.dir/link.d CMakeFiles/octane.dir/main.cpp.o CMakeFiles/octane.dir/FileHandle.cpp.o -o octane  -lpthread

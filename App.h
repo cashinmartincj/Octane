@@ -82,42 +82,75 @@ private:
             [this, socket, buf](asio::error_code ec, std::size_t) {
                 if (ec) return;
 
-                std::string raw {
-                    std::istreambuf_iterator<char>(buf.get()),
-                    std::istreambuf_iterator<char>()
-                };
+                // peek at headers WITHOUT consuming buffer
+                auto data = buf->data();
+                std::string headers_raw(
+                    asio::buffers_begin(data),
+                    asio::buffers_end(data)   // ← doesn't consume
+                );
 
-#ifdef OCTANE_DEV_MODE
-                if (raw.find("/__reload") != std::string::npos) {
-                    serve_reload(socket);
-                    return;
+                // check Content-Length
+                HttpRequest req = HttpParser::parse(headers_raw);
+                int content_length = 0;
+                auto cl = req.header("Content-Length");
+                if (!cl.empty()) {
+                    try { content_length = std::stoi(cl); } catch (...) {}
                 }
-#endif
-                // 1. parse
-                HttpRequest  req = HttpParser::parse(raw);
 
-                // 2. resolve
-                HttpResponse res;
-                if (!router_.resolve(req, res))
-                    res.status(404).json(R"({"error":"not found"})");
+                int already_read = (int)buf->size();
+                int remaining    = content_length - already_read;
 
-#ifdef OCTANE_DEV_MODE
-                // 3. inject live reload into HTML responses
-                if (res.content_type == ContentType::TEXT_HTML) {
-                    auto pos = res.body.find("</body>");
-                    if (pos != std::string::npos)
-                        res.body.insert(pos, LIVE_RELOAD_SCRIPT);
-                    res.headers["Content-Length"] = std::to_string(res.body.size());
+                if (remaining > 0) {
+                    asio::async_read(*socket, *buf,
+                        asio::transfer_exactly(remaining),
+                        [this, socket, buf](asio::error_code ec, std::size_t) {
+                            if (ec) return;
+                            dispatch(socket, buf);
+                        });
+                } else {
+                    dispatch(socket, buf);
                 }
-#endif
-                // 4. async write — don't block while sending
-                auto payload = std::make_shared<std::string>(res.serialize());
-                asio::async_write(*socket, asio::buffer(*payload),
-                    [this, socket, payload](asio::error_code ec, std::size_t) {
-                        if (ec) return;
-                        handle_connection(socket);
-                        // socket closes here automatically
-                    });
+            });
+    }
+
+    void dispatch(std::shared_ptr<tcp::socket> socket,
+                std::shared_ptr<asio::streambuf> buf) {
+
+        std::string raw {
+            std::istreambuf_iterator<char>(buf.get()),
+            std::istreambuf_iterator<char>()
+        };
+
+    #ifdef OCTANE_DEV_MODE
+        if (raw.find("/__reload") != std::string::npos) {
+            serve_reload(socket);
+            return;
+        }
+    #endif
+
+        // 1. parse — body now included
+        HttpRequest  req = HttpParser::parse(raw);
+
+        // 2. resolve
+        HttpResponse res;
+        if (!router_.resolve(req, res))
+            res.status(404).json(R"({"error":"not found"})");
+
+    #ifdef OCTANE_DEV_MODE
+        if (res.content_type == ContentType::TEXT_HTML) {
+            auto pos = res.body.find("</body>");
+            if (pos != std::string::npos)
+                res.body.insert(pos, LIVE_RELOAD_SCRIPT);
+            res.headers["Content-Length"] = std::to_string(res.body.size());
+        }
+    #endif
+
+        // 3. async write
+        auto payload = std::make_shared<std::string>(res.serialize());
+        asio::async_write(*socket, asio::buffer(*payload),
+            [this, socket, payload](asio::error_code ec, std::size_t) {
+                if (ec) return;
+                handle_connection(socket);
             });
     }
 

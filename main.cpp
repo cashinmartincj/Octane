@@ -26,7 +26,7 @@ class GetHtml : public routes::Get<GetHtml> {
 public:
     void handle(const HttpRequest& req, HttpResponse& res) {
         static auto file = [](){
-        auto f = std::make_unique<MappedFile>();
+            auto f = std::make_unique<MappedFile>();
             f->open("index.html");
             return f;   // ← unique_ptr is moveable, not copyable — works fine
         }();
@@ -35,6 +35,12 @@ public:
     }
 };
 
+class PostEcho : public routes::Post<PostEcho> {
+public:
+    void handle(const HttpRequest& req, HttpResponse& res) {
+        res.status(200).json(req.body);
+    }
+};
 
 class GetValue : public routes::Get<GetValue> {
 public:
@@ -70,5 +76,6 @@ int main() {
     app.get<GetImage>("/image");
     app.get<GetHtml>("/");
     app.get<GetValue>("/value");
+    app.post<PostEcho>("/echo");   // ← same pattern
     app.listen(8080);
 }
