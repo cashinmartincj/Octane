@@ -1,13 +1,38 @@
-// HttpParser.h
+/**
+ * @file HttpParser.h
+ * @brief Parses raw HTTP/1.1 request bytes into an HttpRequest struct
+ *
+ * Designed for zero allocation where possible — uses string_view to
+ * view into the original buffer rather than copying substrings.
+ *
+ * Handles:
+ *   Request line  — method, path, query string, HTTP version
+ *   Headers       — key/value pairs, case preserved
+ *   Body          — raw bytes after \r\n\r\n
+ *   Cookies       — parsed from Cookie header into req.cookies
+ *   Content-Type  — parsed into req.content_type enum
+ *   Query string  — parsed into req.query map, URL decoded
+ */
+
 #pragma once
 #include "HttpRequest.h"
 #include "HttpTypes.h"
 #include <string>
 #include <unordered_map>
 
-// ✅ string_view — zero allocation, views into original buffer
 class HttpParser {
 public:
+
+    /**
+     * @brief Parse raw HTTP/1.1 request bytes into HttpRequest
+     *
+     * Splits on \r\n\r\n to separate headers from body.
+     * Uses string_view throughout to avoid copies where possible.
+     * Body is the only field that requires an owning copy.
+     *
+     * @param raw  Complete raw HTTP request bytes
+     * @return     Populated HttpRequest, default-constructed on parse failure
+     */
     static HttpRequest parse(const std::string& raw) {
         HttpRequest req;
         std::string_view view(raw);
@@ -74,6 +99,15 @@ private:
         req.headers[key]  = std::move(value);
     }
 
+    /**
+     * @brief Parse URL query string into key/value map
+     *
+     * Format: "key1=val1&key2=val2"
+     * Keys and values are URL decoded — %20 → ' ', + → ' '
+     *
+     * @param qs     Query string without leading '?'
+     * @param query  Map to populate
+     */
     static void parseQueryString(std::string_view qs,
                                   std::unordered_map<std::string, std::string>& query) {
         while (!qs.empty()) {
