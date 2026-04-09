@@ -1,31 +1,49 @@
 cmake_minimum_required(VERSION 3.20)
-project(octane)
+project(octane VERSION 0.1.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-add_executable(octane
-    main.cpp
-    FileHandle.cpp
+# ── library ───────────────────────────────────
+add_library(octane_lib src/FileHandle.cpp)
+
+target_include_directories(octane_lib PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<INSTALL_INTERFACE:include>
 )
 
-configure_file(index.html ${CMAKE_CURRENT_BINARY_DIR}/index.html COPYONLY)
-
-target_include_directories(octane PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}
+target_compile_definitions(octane_lib PUBLIC
+    ASIO_STANDALONE
+    _WIN32_WINNT=0x0601
 )
 
-# ── asio header only — no find_package needed ──
-target_compile_definitions(octane PRIVATE
-    ASIO_STANDALONE          # no boost dependency
-    _WIN32_WINNT=0x0601      # windows only — ignore on linux
-)
+target_link_libraries(octane_lib PUBLIC pthread)
 
-# linux needs pthread
-target_link_libraries(octane PRIVATE pthread)
-
-# dev mode
+# ── dev mode ──────────────────────────────────
 option(OCTANE_DEV_MODE "Enable live reload" OFF)
 if(OCTANE_DEV_MODE)
-    target_compile_definitions(octane PRIVATE OCTANE_DEV_MODE)
+    target_compile_definitions(octane_lib PUBLIC OCTANE_DEV_MODE)
 endif()
+
+# ── examples ──────────────────────────────────
+option(OCTANE_BUILD_EXAMPLES "Build examples" ON)
+if(OCTANE_BUILD_EXAMPLES)
+    add_subdirectory(examples/01_hello_world)
+    add_subdirectory(examples/02_rest_api)
+    # add_subdirectory(examples/03_static_files)
+endif()
+
+# ── install ───────────────────────────────────
+install(TARGETS octane_lib
+    EXPORT OctaneTargets
+    ARCHIVE DESTINATION lib
+    LIBRARY DESTINATION lib
+)
+
+install(DIRECTORY include/ DESTINATION include/octane)
+
+install(EXPORT OctaneTargets
+    FILE OctaneTargets.cmake
+    NAMESPACE Octane::
+    DESTINATION lib/cmake/octane
+)
