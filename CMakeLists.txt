@@ -4,11 +4,21 @@ project(octane VERSION 0.1.0 LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# ── fetch asio ────────────────────────────────
+include(FetchContent)
+FetchContent_Declare(
+    asio
+    GIT_REPOSITORY https://github.com/chriskohlhoff/asio
+    GIT_TAG        asio-1-28-0
+)
+FetchContent_MakeAvailable(asio)
+
 # ── library ───────────────────────────────────
 add_library(octane_lib src/FileHandle.cpp)
 
 target_include_directories(octane_lib PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<BUILD_INTERFACE:${asio_SOURCE_DIR}/asio/include>
     $<INSTALL_INTERFACE:include>
 )
 
@@ -29,7 +39,7 @@ endif()
 option(OCTANE_BUILD_EXAMPLES "Build examples" ON)
 if(OCTANE_BUILD_EXAMPLES)
     add_subdirectory(examples/01_hello_world)
-    add_subdirectory(examples/02_rest_api)
+    # add_subdirectory(examples/02_rest_api)
     # add_subdirectory(examples/03_static_files)
 endif()
 

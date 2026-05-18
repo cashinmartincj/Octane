@@ -27,7 +27,7 @@
 #include "HttpRequest.h"
 #include "HttpResponse.h"
 
-namespace routes {
+namespace octane::routes {
 
     /**
     * @brief CRTP base for all route handlers

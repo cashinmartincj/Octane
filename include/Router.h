@@ -30,72 +30,75 @@
 #include <unordered_map>
 #include <string>
 
-class Router {
-public:
+namespace octane
+{
+    class Router {
+        public:
 
-    // ── Route Registration ───────────────────────
+            // ── Route Registration ───────────────────────
 
-    void add(const std::string& method,
-             const std::string& path,
-             Handler            handler) {
-        std::string key = makeKey(method, path);
-        if (isDynamic(path))
-            dynamic_.insert(key, std::move(handler));
-        else
-            static_[key] = std::move(handler);
-    }
+            void add(const std::string& method,
+                    const std::string& path,
+                    Handler            handler) {
+                std::string key = makeKey(method, path);
+                if (isDynamic(path))
+                    dynamic_.insert(key, std::move(handler));
+                else
+                    static_[key] = std::move(handler);
+            }
 
-    void get    (const std::string& path, Handler h) { add("GET",     path, std::move(h)); }
-    void post   (const std::string& path, Handler h) { add("POST",    path, std::move(h)); }
-    void put    (const std::string& path, Handler h) { add("PUT",     path, std::move(h)); }
-    void patch  (const std::string& path, Handler h) { add("PATCH",   path, std::move(h)); }
-    void del    (const std::string& path, Handler h) { add("DELETE",  path, std::move(h)); }
-    void options(const std::string& path, Handler h) { add("OPTIONS", path, std::move(h)); }
-    void head   (const std::string& path, Handler h) { add("HEAD",    path, std::move(h)); }
+            void get    (const std::string& path, Handler h) { add("GET",     path, std::move(h)); }
+            void post   (const std::string& path, Handler h) { add("POST",    path, std::move(h)); }
+            void put    (const std::string& path, Handler h) { add("PUT",     path, std::move(h)); }
+            void patch  (const std::string& path, Handler h) { add("PATCH",   path, std::move(h)); }
+            void del    (const std::string& path, Handler h) { add("DELETE",  path, std::move(h)); }
+            void options(const std::string& path, Handler h) { add("OPTIONS", path, std::move(h)); }
+            void head   (const std::string& path, Handler h) { add("HEAD",    path, std::move(h)); }
 
-    // ── Route Resolution ─────────────────────────
+            // ── Route Resolution ─────────────────────────
 
-    bool resolve(HttpRequest& req, HttpResponse& res) {
-        std::string key = makeKey(methodToString(req.method), req.path);
+            bool resolve(HttpRequest& req, HttpResponse& res) {
+                std::string key = makeKey(methodToString(req.method), req.path);
 
-        // 1. static lookup — O(1)
-        auto it = static_.find(key);
-        if (it != static_.end()) {
-            it->second(req, res);
-            return true;
-        }
+                // 1. static lookup — O(1)
+                auto it = static_.find(key);
+                if (it != static_.end()) {
+                    it->second(req, res);
+                    return true;
+                }
 
-        // 2. dynamic lookup — O(k)
-        Handler matched;
-        if (dynamic_.search(key, matched, req.params)) {
-            matched(req, res);
-            return true;
-        }
-        return false;
-    }
+                // 2. dynamic lookup — O(k)
+                Handler matched;
+                if (dynamic_.search(key, matched, req.params)) {
+                    matched(req, res);
+                    return true;
+                }
+                return false;
+            }
 
-private:
-    std::unordered_map<std::string, Handler> static_;  // O(1)  exact paths
-    Trie                                     dynamic_; // O(k)  parameterised paths
-    static std::string makeKey(const std::string& method,
-                                const std::string& path) {
-        return method + ":" + path;
-    }
+        private:
+            std::unordered_map<std::string, Handler> static_;  // O(1)  exact paths
+            Trie                                     dynamic_; // O(k)  parameterised paths
+            static std::string makeKey(const std::string& method,
+                                        const std::string& path) {
+                return method + ":" + path;
+            }
 
-    static bool isDynamic(const std::string& path) {
-        return path.find(':') != std::string::npos;
-    }
+            static bool isDynamic(const std::string& path) {
+                return path.find(':') != std::string::npos;
+            }
 
-    static std::string methodToString(HttpMethod m) {
-        switch (m) {
-            case HttpMethod::GET:     return "GET";
-            case HttpMethod::POST:    return "POST";
-            case HttpMethod::PUT:     return "PUT";
-            case HttpMethod::PATCH:   return "PATCH";
-            case HttpMethod::DEL:     return "DELETE";
-            case HttpMethod::OPTIONS: return "OPTIONS";
-            case HttpMethod::HEAD:    return "HEAD";
-            default:                  return "UNKNOWN";
-        }
-    }
-};
+            static std::string methodToString(HttpMethod m) {
+                switch (m) {
+                    case HttpMethod::GET:     return "GET";
+                    case HttpMethod::POST:    return "POST";
+                    case HttpMethod::PUT:     return "PUT";
+                    case HttpMethod::PATCH:   return "PATCH";
+                    case HttpMethod::DEL:     return "DELETE";
+                    case HttpMethod::OPTIONS: return "OPTIONS";
+                    case HttpMethod::HEAD:    return "HEAD";
+                    default:                  return "UNKNOWN";
+                }
+            }
+    };
+}

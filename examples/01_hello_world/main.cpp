@@ -5,6 +5,8 @@
 #include "FileHandle.h"
 #include <filesystem>
 
+// using namespace octane;
+
 static std::string exe_dir() {
 #ifdef _WIN32
     char result[1024];
@@ -25,11 +27,11 @@ static std::string exe_dir() {
 #endif
 }
 
-class GetHtml : public routes::Get<GetHtml> {
+class GetHtml : public octane::routes::Get<GetHtml> {
 public:
-    void handle(const HttpRequest& req, HttpResponse& res) {
+    void handle(const octane::HttpRequest& req, octane::HttpResponse& res) {
         static auto f = []() {
-            auto p = std::make_unique<MappedFile>();
+            auto p = std::make_unique<octane::utils::MappedFile>();
             if (!p->open(exe_dir() + "/index.html"))
                 std::cerr << "ERROR: failed to open index.html\n";
             else
@@ -46,31 +48,31 @@ public:
     }
 };
 
-class GetCss : public routes::Get<GetCss> {
+class GetCss : public octane::routes::Get<GetCss> {
 public:
-    void handle(const HttpRequest& req, HttpResponse& res) {
-        static auto f = []{ auto p = std::make_unique<MappedFile>(); p->open(exe_dir() + "/style.css"); return p; }();
+    void handle(const octane::HttpRequest& req, octane::HttpResponse& res) {
+        static auto f = []{ auto p = std::make_unique<octane::utils::MappedFile>(); p->open(exe_dir() + "/style.css"); return p; }();
         res.status(200).header("Content-Type", "text/css").send(std::string(f->view()));
     }
 };
 
-class GetJs : public routes::Get<GetJs> {
+class GetJs : public octane::routes::Get<GetJs> {
 public:
-    void handle(const HttpRequest& req, HttpResponse& res) {
-        static auto f = []{ auto p = std::make_unique<MappedFile>(); p->open(exe_dir() + "/app.js"); return p; }();
+    void handle(const octane::HttpRequest& req, octane::HttpResponse& res) {
+        static auto f = []{ auto p = std::make_unique<octane::utils::MappedFile>(); p->open(exe_dir() + "/app.js"); return p; }();
         res.status(200).header("Content-Type", "text/javascript").send(std::string(f->view()));
     }
 };
 
-class GetHello : public routes::Get<GetHello> {
+class GetHello : public octane::routes::Get<GetHello> {
 public:
-    void handle(const HttpRequest& req, HttpResponse& res) {
+    void handle(const octane::HttpRequest& req, octane::HttpResponse& res) {
         res.status(200).json(R"({"message":"hello from octane","framework":"c++","speed":"fast"})");
     }
 };
 
 int main() {
-    App app;
+    octane::App app;
 
     app.get<GetHtml> ("/");
     app.get<GetCss>  ("/style.css");
