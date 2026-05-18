@@ -17,6 +17,8 @@
 #include <mutex>
 #include <atomic>
 
+using namespace octane;
+
 // ── in-memory store ───────────────────────────
 struct User {
     std::string id;
@@ -148,7 +150,6 @@ public:
             return;
         }
 
-        // only update fields that are present in body
         auto name  = extractField(req.body, "name");
         auto email = extractField(req.body, "email");
         if (!name.empty())  it->second.name  = name;
