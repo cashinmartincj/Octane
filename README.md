@@ -4,7 +4,7 @@ A high-performance async HTTP/1.1 web framework written in C++20.
 
 Built on Asio with a thread pool scaled to hardware concurrency, a hybrid router (O(1) hash map for static routes, trie for dynamic), zero-copy file serving via `mmap`, and CRTP-based route handlers with no virtual dispatch overhead.
 
-**~300k req/s** on a standard development machine.
+**~700k req/s** on a standard development machine.
 
 ---
 
