@@ -22,7 +22,7 @@ namespace octane
 
         StringMap params;
         HeaderMap headers;
-        StringMap query;
+        OwnedStringMap query;
         StringMap cookies;
 
         [[nodiscard]] std::string_view param(std::string_view k, std::string_view fb = {}) const noexcept {

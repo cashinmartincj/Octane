@@ -24,7 +24,7 @@ namespace octane
 
         std::unique_ptr<TrieNode> wildcard;
         std::string               wildcard_name;
-        std::optional<Handler>    handler;
+        std::optional<HandlerRoute> handler;
 
         [[nodiscard]] const TrieNode* find_child(std::string_view part) const noexcept {
             if (!map_children.empty()) {
@@ -60,7 +60,7 @@ namespace octane
 
     class Trie {
     public:
-        void insert(const std::string& path, Handler handler) {
+        void insert(const std::string& path, HandlerRoute route) {
             TrieNode* node = &root_;
             std::size_t start = 0;
             const std::size_t len = path.size();
@@ -87,11 +87,11 @@ namespace octane
                     node = node->get_or_create_child(part);
                 }
             }
-            node->handler = std::move(handler);
+            node->handler = std::move(route);
         }
 
         [[nodiscard]] bool search(std::string_view path,
-                                  Handler& out_handler,
+                                  const HandlerRoute*& out_route,
                                   StringMap& params) const noexcept {
             const TrieNode* node = &root_;
             std::size_t start = 0;
@@ -121,7 +121,7 @@ namespace octane
             }
 
             if (!node->handler) return false;
-            out_handler = *node->handler;
+            out_route = &*node->handler;
             return true;
         }
 

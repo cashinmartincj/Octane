@@ -51,6 +51,7 @@ namespace octane
             case 431: return "Request Header Fields Too Large";
             case 500: return "Internal Server Error";
             case 501: return "Not Implemented";
+            case 503: return "Service Unavailable";
             case 505: return "HTTP Version Not Supported";
             default:  return "Unknown";
         }
@@ -145,6 +146,9 @@ namespace octane
             
             bool custom_content_type = false;
             for (const auto& [key, val] : headers) {
+                if (!valid_header_name(key) || !valid_header_value(val)) {
+                    throw std::invalid_argument("Invalid HTTP response header");
+                }
                 if (key.size() == 12 && 
                     (key[0] == 'c' || key[0] == 'C') && 
                     CaseInsensitiveEqual{}(key, "content-type")) {
@@ -172,6 +176,29 @@ namespace octane
             
             response.append("\r\n");
             return response;
+        }
+
+        [[nodiscard]] static bool valid_header_name(std::string_view name) noexcept {
+            if (name.empty()) return false;
+            for (unsigned char c : name) {
+                const bool alpha_numeric =
+                    (c >= 'a' && c <= 'z') ||
+                    (c >= 'A' && c <= 'Z') ||
+                    (c >= '0' && c <= '9');
+                if (!alpha_numeric &&
+                    std::string_view("!#$%&'*+-.^_`|~").find(
+                        static_cast<char>(c)) == std::string_view::npos) {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        [[nodiscard]] static bool valid_header_value(std::string_view value) noexcept {
+            for (unsigned char c : value) {
+                if ((c < 32 && c != '\t') || c == 127) return false;
+            }
+            return true;
         }
 
         // Full serialization for testing, dispatchers, and monolithic writes

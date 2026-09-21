@@ -20,19 +20,22 @@ namespace octane
     public:
         void add(std::string_view method,
                  std::string_view path,
-                 Handler handler) {
+                 Handler handler,
+                 HandlerExecution execution = {}) {
             HttpMethod m = stringToMethod(method);
             if (m == HttpMethod::UNKNOWN) return;
 
             size_t idx = static_cast<size_t>(m);
 
             if (isDynamic(path)) {
-                dynamic_[idx].insert(std::string(path), std::move(handler));
+                dynamic_[idx].insert(
+                    std::string(path), {handler, std::move(execution)});
             } else {
                 // std::deque ensures stable references upon push_back (no reallocation pointer invalidation)
                 path_storage_.emplace_back(path);
                 std::string_view persistent_view = path_storage_.back();
-                static_routes_[idx][persistent_view] = std::move(handler);
+                static_routes_[idx][persistent_view] =
+                    {handler, std::move(execution)};
             }
         }
 
@@ -44,30 +47,38 @@ namespace octane
         void options(std::string_view path, Handler h) { add("OPTIONS", path, std::move(h)); }
         void head   (std::string_view path, Handler h) { add("HEAD",    path, std::move(h)); }
 
-        bool resolve(HttpRequest& req, HttpResponse& res) {
+        void get    (std::string_view path, Handler h, HandlerExecution e) { add("GET",     path, h, std::move(e)); }
+        void post   (std::string_view path, Handler h, HandlerExecution e) { add("POST",    path, h, std::move(e)); }
+        void put    (std::string_view path, Handler h, HandlerExecution e) { add("PUT",     path, h, std::move(e)); }
+        void patch  (std::string_view path, Handler h, HandlerExecution e) { add("PATCH",   path, h, std::move(e)); }
+        void del    (std::string_view path, Handler h, HandlerExecution e) { add("DELETE",  path, h, std::move(e)); }
+        void options(std::string_view path, Handler h, HandlerExecution e) { add("OPTIONS", path, h, std::move(e)); }
+        void head   (std::string_view path, Handler h, HandlerExecution e) { add("HEAD",    path, h, std::move(e)); }
+
+        [[nodiscard]] bool match(HttpRequest& req,
+                                 const HandlerRoute*& route) const noexcept {
             size_t method_idx = static_cast<size_t>(req.method);
             if (method_idx >= 7) return false;
 
-            // 1. Static O(1) direct match
             const auto& method_map = static_routes_[method_idx];
             auto it = method_map.find(req.path);
             if (it != method_map.end()) {
-                it->second(req, res);
+                route = &it->second;
                 return true;
             }
 
-            // 2. Trie lookup for parameterized segments
-            Handler matched = nullptr;
-            if (dynamic_[method_idx].search(req.path, matched, req.params)) {
-                matched(req, res);
-                return true;
-            }
+            return dynamic_[method_idx].search(req.path, route, req.params);
+        }
 
-            return false;
+        bool resolve(HttpRequest& req, HttpResponse& res) {
+            const HandlerRoute* route = nullptr;
+            if (!match(req, route)) return false;
+            route->handler(req, res);
+            return true;
         }
 
     private:
-        using MethodStaticMap = std::unordered_map<std::string_view, Handler, StringViewHash, std::equal_to<>>;
+        using MethodStaticMap = std::unordered_map<std::string_view, HandlerRoute, StringViewHash, std::equal_to<>>;
         
         std::array<MethodStaticMap, 8> static_routes_;
         std::array<Trie, 8>            dynamic_;

@@ -4,6 +4,7 @@
 #include <functional>
 #include <unordered_map>
 #include <cstdint>
+#include <utility>
 
 namespace octane
 {
@@ -64,6 +65,9 @@ namespace octane
     using StringMap = std::unordered_map<std::string_view, std::string_view,
                                          StringViewHash, std::equal_to<>>;
 
+    using OwnedStringMap = std::unordered_map<std::string, std::string,
+                                              StringViewHash, std::equal_to<>>;
+
     using HeaderMap = std::unordered_map<std::string_view, std::string_view,
                                          CaseInsensitiveStringViewHash, CaseInsensitiveEqual>;
 
@@ -71,6 +75,34 @@ namespace octane
     struct HttpResponse;
 
     using Handler = void(*)(HttpRequest&, HttpResponse&);
+
+    enum class HandlerExecutionMode : uint8_t {
+        Inline,
+        SharedBlocking,
+        Named
+    };
+
+    struct HandlerExecution {
+        HandlerExecutionMode mode{HandlerExecutionMode::Inline};
+        std::string queue_name;
+
+        [[nodiscard]] static HandlerExecution inline_execution() {
+            return {};
+        }
+
+        [[nodiscard]] static HandlerExecution shared_blocking() {
+            return {HandlerExecutionMode::SharedBlocking, {}};
+        }
+
+        [[nodiscard]] static HandlerExecution named(std::string name) {
+            return {HandlerExecutionMode::Named, std::move(name)};
+        }
+    };
+
+    struct HandlerRoute {
+        Handler handler{nullptr};
+        HandlerExecution execution{};
+    };
 
     enum class ContentType : uint8_t {
         TEXT_PLAIN, TEXT_HTML, TEXT_CSS, TEXT_JAVASCRIPT, APPLICATION_JSON,

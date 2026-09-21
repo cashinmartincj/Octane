@@ -2,7 +2,7 @@
 
 A high-performance async HTTP/1.1 web framework written in C++20.
 
-Built on Asio with an isolated thread-per-core architecture (`SO_REUSEPORT`), a hybrid zero-allocation router (O(1) hash map for static routes, trie for dynamic), zero-copy file serving via `mmap`, scatter-gather vectorized I/O, and CRTP-based route handlers with no virtual dispatch overhead.
+Built on Linux `io_uring` with an isolated thread-per-core architecture (`SO_REUSEPORT`), a hybrid zero-allocation router (O(1) hash map for static routes, trie for dynamic), zero-copy mapped-body serving, scatter-gather I/O, and CRTP-based route handlers with no virtual dispatch overhead.
 
 Performance needs to be measured for your workload. See the transport limits, supported protocol behavior, and reproducible checks below.
 
@@ -10,10 +10,13 @@ Performance needs to be measured for your workload. See the transport limits, su
 
 ## Features
 
-- **Thread-per-core architecture** — independent event loops (`asio::io_context`) per core with zero lock contention.
+- **Thread-per-core architecture** — an independent `io_uring` and listening socket per worker.
 - **Kernel-level connection balancing** — Linux `SO_REUSEPORT` socket distribution.
-- **Zero-copy scatter-gather I/O** — headers and payloads transmitted together via `writev` descriptors.
-- **Ring/rolling buffer pipeline** — eliminates `memmove` and repeated reallocations on keep-alive streams.
+- **Scatter-gather response I/O** — headers and payloads are submitted together with `sendmsg`; mapped bodies are not copied into an intermediate response string.
+- **Rolling input window** — amortizes compaction and reallocations on pipelined keep-alive streams.
+- **Batched ring operation** — completion queues are drained in batches and generated submissions are flushed together.
+- **Multishot accept** — used when supported by the running kernel, with automatic single-shot fallback.
+- **Per-route execution policy** — keep small handlers inline or isolate blocking work in bounded shared/named queues.
 - **TCP_NODELAY enabled** — sub-millisecond tail latency by disabling Nagle's algorithm.
 - **Persistent keep-alive connections** with pipelining support.
 - **Hybrid router** — O(1) static route lookup, trie for dynamic routes with path parameters.
@@ -29,9 +32,11 @@ Performance needs to be measured for your workload. See the transport limits, su
 
 - C++20
 - CMake 3.20+
-- Platform threads (`Threads::Threads` / `pthreads` on Linux/macOS)
+- Linux with `io_uring` support
+- `liburing` and `pkg-config`
+- Platform threads (`pthreads`)
 
-> Asio is fetched automatically via CMake FetchContent — no manual install needed.
+Install the development package for `liburing` before configuring the default backend.
 
 ---
 
@@ -39,9 +44,9 @@ Performance needs to be measured for your workload. See the transport limits, su
 
 | Platform | Status |
 | --- | --- |
-| Linux | ✅ Full support (`SO_REUSEPORT` kernel balancing) |
-| macOS | ✅ Full support |
-| Windows | ✅ Full support |
+| Linux | ✅ Native `io_uring` backend with `SO_REUSEPORT` |
+| macOS | ❌ Native backend unavailable |
+| Windows | ❌ Native backend unavailable |
 
 ---
 
@@ -54,6 +59,7 @@ Octane supports bounded Content-Length requests over HTTP/1.0 and HTTP/1.1. It i
 - Expect requests receive 417; chunked decoding and 100-continue are future work.
 - Only origin-form targets and `OPTIONS *` are supported.
 - Host presence, duplicates, and unsafe delimiters are checked; full URI authority validation and proxy absolute-form handling are not implemented.
+- Query names and values percent-decode valid `%HH` octets into owned strings. A plus sign remains a literal `+`; form-style plus-to-space conversion is not applied to the URI query.
 
 ### Configuration
 
@@ -75,11 +81,63 @@ These are the defaults. Header bytes include the request line and final CRLF. Th
 
 Limits are per connection, not a global memory budget: request storage, parsed maps, output strings and application allocations add overhead. Application response size is not currently capped.
 
-Each connection executes strictly within its assigned event loop. Input and output storage stays owned until completion; request accessors return borrowed views which handlers must not retain beyond request lifetime. Complete pipelined requests are processed in arrival order. The transport owns Content-Length and Connection response fields. HEAD responses and 204/304 statuses suppress the body. User-provided response headers cannot inject CR/LF or override framing. Handler or serialization exceptions produce a 500 and close; exception details are not sent to clients.
+Each connection executes strictly within its assigned ring thread. Input and output storage stays owned until completion; request accessors return borrowed views which handlers must not retain beyond request lifetime. Complete pipelined requests are processed in arrival order. The transport owns Content-Length and Connection response fields. HEAD responses and 204/304 statuses suppress the body. Handler or serialization exceptions produce a 500 and close; exception details are not sent to clients.
 
-SIGINT/SIGTERM (or `TcpServer::stop()`) stop accepting, close idle/header-reading connections, and let requests already reading bodies or writing responses finish. Remaining connections are cancelled after the shutdown deadline. Worker threads join after cancellation callbacks drain. Application handlers still execute synchronously: a blocking handler cannot be preempted, can delay its deadline, and can delay shutdown. Offload blocking work; a future asynchronous handler API should define its own lifetime and cancellation contract.
+SIGINT/SIGTERM (or `TcpServer::stop()`) stop accepting, close idle connections, and let active requests, queued handlers, or responses drain. Ring cancellation completions are drained before worker exit. Only one signal-managed `TcpServer` may listen in a process at a time. Inline handlers execute synchronously and therefore must not block; blocking handlers should opt into one of the bounded execution queues.
 
-HTTP parsing and dispatch are independent of Asio sockets. A future io_uring transport must preserve ordered completion, cancellation, and buffer ownership; this change does not implement that backend.
+The transport pools operation contexts, tracks partial writes without rebuilding response buffers, and keeps one allocation-free indexed deadline-heap entry per active connection instead of scanning every connection or attaching a timeout SQE to every operation. Connections and completion handles are owned by one ring shard without hot-path shared-reference counting. Worker failures propagate back through `listen()`. The exact global connection cap still requires one relaxed atomic update on accept and close.
+
+Workers are pinned to CPUs from the process's allowed affinity mask by default, and each ring defaults to 256 entries. Both choices are configurable:
+
+```cpp
+octane::transport::TcpServerOptions transport;
+transport.pin_workers = true;
+transport.ring_queue_depth = 256;
+transport.execution_queues.shared_threads_per_shard = 1;
+transport.execution_queues.shared_capacity = 1024;
+transport.execution_queues.named.push_back({"database", 2, 256});
+app.listen(8080, 8, limits, transport);
+```
+
+Disable worker pinning when an external runtime manages affinity. Queue depth should be measured under the intended concurrency; making it very large consumes additional locked kernel memory and is not automatically faster.
+
+Handlers are inline by default. Offloading is explicit:
+
+```cpp
+app.get("/health", health); // Inline fast path: no request copy or queue hop.
+app.post("/reports", reports,
+         octane::HandlerExecution::shared_blocking());
+app.get("/users", users,
+        octane::HandlerExecution::named("database"));
+```
+
+Execution queues are shard-local. With eight ring workers, a named configuration using two `threads_per_shard` creates at most sixteen threads once that queue is first used. `capacity` limits waiting jobs per shard; it does not include currently executing jobs. A saturated shared queue, saturated named queue, or unconfigured named queue returns `503 Service Unavailable` and closes that connection.
+
+Only offloaded requests are materialized into owned raw request storage and reparsed on the queue worker, so their header, path, parameter, cookie, query, and body views remain valid. Responses are posted through an `eventfd` wakeup to the connection's owning ring. This copy, queue synchronization, and thread handoff make offloading inappropriate for trivial handlers; leave those inline.
+
+## Origin Deployment Behind NGINX or Cloudflare
+
+Octane is intended to run as an HTTP/1.1 origin behind a production edge rather than terminate public TLS directly. Keep the origin bound to a private interface, loopback address, firewall-restricted address, or Cloudflare Tunnel. Do not trust forwarding headers from arbitrary clients; accept them only when direct access to the origin is blocked.
+
+For NGINX, enable [request buffering](https://nginx.org/en/docs/http/ngx_http_proxy_module.html#proxy_request_buffering) and apply an edge body limit no larger than the application's configured limit. Preserve upstream keep-alive and forwarding metadata only from the trusted proxy:
+
+```nginx
+location / {
+    client_max_body_size 1m;
+    proxy_request_buffering on;
+    proxy_buffering on;
+    proxy_http_version 1.1;
+    proxy_set_header Connection "";
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_pass http://127.0.0.1:8080;
+}
+```
+
+Octane deliberately rejects chunked request bodies. Confirm that the selected proxy configuration buffers and forwards bodies with `Content-Length`; do not expose the origin until that behavior has been tested with the deployed proxy version.
+
+For [Cloudflare Tunnel](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/), point the local service at Octane's private HTTP listener and enable the [`disableChunkedEncoding`](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/configure-tunnels/origin-parameters/#disablechunkedencoding) origin option. Tunnel uses outbound-only connections, allowing inbound access to the origin to remain blocked. Use more than one tunnel connector where origin availability requires it.
 
 ## Build
 
@@ -163,14 +221,18 @@ wrk -t8 -c128 -d30s --latency http://127.0.0.1:8080/
 - **Median Latency:** ~102 µs
 - **99% Latency:** ~1.26 ms
 
-## Validation Performed for This Change
+## Validation Performed for This Transport Revision
 
-- **GCC Release:** all four CTest tests passed.
-- **Clang ASan/UBSan:** all four CTest tests passed, including real TCP tests.
-- **Final parser revision:** 100,000 libFuzzer inputs completed without findings.
-- **Benchmark smoke:** 2,000 GET and 2,000 4 KiB POST requests completed with zero reported errors in each build. These short local runs validate the harness; they are not capacity measurements.
+- The project compiled successfully with the configured GCC C++20 build.
+- `request_dispatch` and the real-socket `tcp_transport` regression tests passed.
+- The GCC ThreadSanitizer transport run passed after replacing asynchronous signal-handler state with a blocked-signal waiter and atomic stop flag.
+- Clang ASan/UBSan passed the request, transport, and benchmark tests with leak detection enabled.
+- All five CTest tests passed, including parser hardening, request dispatch, bounded execution queues, real TCP behavior, and the benchmark smoke test.
+- `benchmark_smoke` completed 2,000 GET and 2,000 4 KiB POST requests with zero reported errors.
+- A ten-second local Release `wrk` regression run (`-t8 -c256`) with execution queues compiled in measured about 615k inline GET requests/s, with approximately 429 us median and 0.74 ms p99 latency. The immediately preceding build without execution queues measured about 618k requests/s; that difference is within normal local-run variation. Loopback results are regression checks rather than capacity claims.
+- A longer Release soak completed approximately 17.55 million GETs over 30 seconds at 256 connections, followed by 128,000 persistent 4 KiB POSTs, with zero reported errors.
 
-No ThreadSanitizer run, extended soak test, or full HTTP conformance audit was performed. The Asio 1.28 headers emit deprecated literal-operator syntax warnings under Clang 22; they did not prevent the build or checks from passing.
+No multi-hour soak test or full HTTP conformance audit was performed for this revision. A slow handler explicitly left inline remains capable of stalling its assigned ring thread.
 
 ## Quick Start Guide
 

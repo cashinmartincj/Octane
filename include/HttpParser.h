@@ -56,14 +56,20 @@ namespace octane
                 }
             }
 
+            const auto content_length_it =
+                req.headers.find(std::string_view{"content-length"});
+            const bool has_content_length =
+                content_length_it != req.headers.end();
+
             if (!req.header("transfer-encoding").empty()) {
-                if (!req.header("content-length").empty()) throw HttpParseError(400);
+                if (has_content_length) throw HttpParseError(400);
                 throw HttpParseError(501); 
             }
 
             req.content_length = 0;
-            const auto cl_val = req.header("content-length");
-            if (!cl_val.empty()) {
+            if (has_content_length) {
+                const auto cl_val = content_length_it->second;
+                if (cl_val.empty()) throw HttpParseError(400);
                 for (char c : cl_val) {
                     if (c < '0' || c > '9') throw HttpParseError(400);
                 }
@@ -190,13 +196,32 @@ namespace octane
             }
         }
 
-        static void parseQueryString(std::string_view qs, StringMap& query) {
+        static std::string decodeQueryComponent(std::string_view encoded) {
+            std::string decoded;
+            decoded.reserve(encoded.size());
+            for (std::size_t i = 0; i < encoded.size(); ++i) {
+                if (encoded[i] != '%') {
+                    decoded.push_back(encoded[i]);
+                    continue;
+                }
+                if (i + 2 >= encoded.size()) throw HttpParseError(400);
+                const int high = hex(static_cast<unsigned char>(encoded[i + 1]));
+                const int low = hex(static_cast<unsigned char>(encoded[i + 2]));
+                if (high < 0 || low < 0) throw HttpParseError(400);
+                decoded.push_back(static_cast<char>((high << 4) | low));
+                i += 2;
+            }
+            return decoded;
+        }
+
+        static void parseQueryString(std::string_view qs, OwnedStringMap& query) {
             while (!qs.empty()) {
                 auto amp = qs.find('&');
                 std::string_view pair = (amp == std::string_view::npos) ? qs : qs.substr(0, amp);
                 auto eq = pair.find('=');
                 if (eq != std::string_view::npos) {
-                    query[pair.substr(0, eq)] = pair.substr(eq + 1);
+                    query[decodeQueryComponent(pair.substr(0, eq))] =
+                        decodeQueryComponent(pair.substr(eq + 1));
                 }
                 if (amp == std::string_view::npos) break;
                 qs.remove_prefix(amp + 1);

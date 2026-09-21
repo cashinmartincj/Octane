@@ -46,6 +46,24 @@ try:
     request(b'GET / HTTP/1.1\r\nHost: x\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\n', 400)
     request(b'GET / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n', 501)
     request(b'GET /throw HTTP/1.1\r\nHost: x\r\n\r\n', 500)
+    with connect() as s:
+        body = b'payload'
+        s.sendall(
+            b'POST /shared/42?value=query HTTP/1.1\r\nHost: x\r\n'
+            b'X-Test: header\r\nContent-Length: 7\r\nConnection: close\r\n\r\n' + body)
+        data = all_bytes(s)
+        assert data.startswith(b'HTTP/1.1 200') and data.endswith(
+            b'42:query:header:payload'), data
+    time.sleep(.03)
+    with connect() as s:
+        s.sendall(
+            b'POST /named/7 HTTP/1.1\r\nHost: x\r\nContent-Length: 4\r\n'
+            b'Connection: close\r\n\r\ndata')
+        data = all_bytes(s)
+        assert data.startswith(b'HTTP/1.1 200') and data.endswith(b'7:data'), data
+    time.sleep(.03)
+    request(b'GET /named-throw HTTP/1.1\r\nHost: x\r\n\r\n', 500)
+    request(b'GET /missing-queue HTTP/1.1\r\nHost: x\r\n\r\n', 503)
     request(b'GET /close HTTP/1.1\r\nHost: x\r\n\r\n', 200)
     with connect() as s:
         s.sendall(b'HEAD / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n')
