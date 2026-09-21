@@ -1,106 +1,109 @@
-/**
- * @file HttpTypes.h
- * @brief Core types shared across the Octane framework
- *
- * Contains:
- *   Handler     — function pointer type for route callbacks
- *   ContentType — enum of supported MIME types
- *   HttpMethod  — enum of supported HTTP methods
- *   parseContentType() — parses raw Content-Type header into enum
- *
- * Forward declares HttpRequest and HttpResponse to avoid
- * circular includes across the framework headers.
- */
-
 #pragma once
 #include <string>
+#include <string_view>
+#include <functional>
 #include <unordered_map>
+#include <cstdint>
 
 namespace octane
 {
+    // Fast FNV-1a transparent hash for string_view and std::string
+    struct StringViewHash {
+        using is_transparent = void;
 
-    // forward declarations — avoid circular includes
+        [[nodiscard]] std::size_t operator()(std::string_view sv) const noexcept {
+            std::size_t hash = 14695981039346656037ULL;
+            for (char c : sv) {
+                hash ^= static_cast<unsigned char>(c);
+                hash *= 1099511628211ULL;
+            }
+            return hash;
+        }
+
+        [[nodiscard]] std::size_t operator()(const std::string& s) const noexcept {
+            return (*this)(std::string_view(s));
+        }
+    };
+
+    // Case-insensitive hash for HTTP header normalization lookups
+    struct CaseInsensitiveStringViewHash {
+        using is_transparent = void;
+
+        [[nodiscard]] std::size_t operator()(std::string_view sv) const noexcept {
+            std::size_t hash = 14695981039346656037ULL;
+            for (char c : sv) {
+                unsigned char uc = static_cast<unsigned char>(c);
+                if (uc >= 'A' && uc <= 'Z') uc += 32;
+                hash ^= uc;
+                hash *= 1099511628211ULL;
+            }
+            return hash;
+        }
+
+        [[nodiscard]] std::size_t operator()(const std::string& s) const noexcept {
+            return (*this)(std::string_view(s));
+        }
+    };
+
+    struct CaseInsensitiveEqual {
+        using is_transparent = void;
+
+        [[nodiscard]] bool operator()(std::string_view a, std::string_view b) const noexcept {
+            if (a.size() != b.size()) return false;
+            for (std::size_t i = 0; i < a.size(); ++i) {
+                unsigned char ca = static_cast<unsigned char>(a[i]);
+                unsigned char cb = static_cast<unsigned char>(b[i]);
+                if (ca >= 'A' && ca <= 'Z') ca += 32;
+                if (cb >= 'A' && cb <= 'Z') cb += 32;
+                if (ca != cb) return false;
+            }
+            return true;
+        }
+    };
+
+    using StringMap = std::unordered_map<std::string_view, std::string_view,
+                                         StringViewHash, std::equal_to<>>;
+
+    using HeaderMap = std::unordered_map<std::string_view, std::string_view,
+                                         CaseInsensitiveStringViewHash, CaseInsensitiveEqual>;
+
     struct HttpRequest;
     struct HttpResponse;
 
-    /**
-     * @brief Route handler function pointer type
-     *
-     * Every route handler in Octane has this signature:
-     *   void handle(HttpRequest& req, HttpResponse& res)
-     *
-     * req  — incoming request, read only
-     * res  — outgoing response, write to this
-     */
     using Handler = void(*)(HttpRequest&, HttpResponse&);
 
-    /**
-     * @brief Supported MIME / Content-Type values
-     *
-     * Used in both HttpRequest (incoming Content-Type)
-     * and HttpResponse (outgoing Content-Type).
-     */
-    enum class ContentType {
-        TEXT_PLAIN,
-        TEXT_HTML,
-        TEXT_CSS,
-        TEXT_JAVASCRIPT,
-        APPLICATION_JSON,
-        APPLICATION_XML,
-        APPLICATION_PDF,
-        APPLICATION_FORM_URLENCODED,
-        MULTIPART_FORM_DATA,
-        IMAGE_JPEG,
-        IMAGE_PNG,
-        IMAGE_GIF,
-        IMAGE_WEBP,
-        IMAGE_SVG,
-        OCTET_STREAM,
-        UNKNOWN
+    enum class ContentType : uint8_t {
+        TEXT_PLAIN, TEXT_HTML, TEXT_CSS, TEXT_JAVASCRIPT, APPLICATION_JSON,
+        APPLICATION_XML, APPLICATION_PDF, APPLICATION_FORM_URLENCODED,
+        MULTIPART_FORM_DATA, IMAGE_JPEG, IMAGE_PNG, IMAGE_GIF, IMAGE_WEBP,
+        IMAGE_SVG, OCTET_STREAM, UNKNOWN
     };
 
-    /**
-     * @brief Supported HTTP methods
-     *
-     * DEL is used instead of DELETE — DELETE is a reserved
-     * macro on some platforms (Windows).
-     */
-    enum class HttpMethod {
-        GET,
-        POST,
-        PUT,
-        PATCH,
-        DEL,
-        OPTIONS,
-        HEAD,
-        UNKNOWN
+    enum class HttpMethod : uint8_t { 
+        GET = 0, POST = 1, PUT = 2, PATCH = 3, DEL = 4, OPTIONS = 5, HEAD = 6, UNKNOWN = 7 
     };
 
-    inline ContentType parseContentType(const std::string& raw) {
-        static const std::unordered_map<std::string, ContentType> map = {
-            { "text/plain",                        ContentType::TEXT_PLAIN },
-            { "text/html",                         ContentType::TEXT_HTML },
-            { "text/css",                          ContentType::TEXT_CSS },
-            { "text/javascript",                   ContentType::TEXT_JAVASCRIPT },
-            { "application/json",                  ContentType::APPLICATION_JSON },
-            { "application/xml",                   ContentType::APPLICATION_XML },
-            { "application/pdf",                   ContentType::APPLICATION_PDF },
-            { "application/x-www-form-urlencoded", ContentType::APPLICATION_FORM_URLENCODED },
-            { "multipart/form-data",               ContentType::MULTIPART_FORM_DATA },
-            { "image/jpeg",                        ContentType::IMAGE_JPEG },
-            { "image/png",                         ContentType::IMAGE_PNG },
-            { "image/gif",                         ContentType::IMAGE_GIF },
-            { "image/webp",                        ContentType::IMAGE_WEBP },
-            { "image/svg+xml",                     ContentType::IMAGE_SVG },
-            { "application/octet-stream",          ContentType::OCTET_STREAM },
-        };
-
+    inline ContentType parseContentType(std::string_view raw) noexcept {
         auto semicolon = raw.find(';');
-        std::string key = semicolon != std::string::npos ? raw.substr(0, semicolon) : raw;
-        while (!key.empty() && key.back() == ' ') key.pop_back();
+        std::string_view key = raw.substr(0, semicolon);
+        while (!key.empty() && key.back() == ' ') key.remove_suffix(1);
 
-        auto it = map.find(key);
-        return it != map.end() ? it->second : ContentType::UNKNOWN;
+        if (key == "text/plain")                        return ContentType::TEXT_PLAIN;
+        if (key == "application/json")                  return ContentType::APPLICATION_JSON;
+        if (key == "text/html")                         return ContentType::TEXT_HTML;
+        if (key == "text/css")                          return ContentType::TEXT_CSS;
+        if (key == "text/javascript")                   return ContentType::TEXT_JAVASCRIPT;
+        if (key == "application/x-www-form-urlencoded") return ContentType::APPLICATION_FORM_URLENCODED;
+        if (key == "multipart/form-data")               return ContentType::MULTIPART_FORM_DATA;
+        if (key == "image/png")                         return ContentType::IMAGE_PNG;
+        if (key == "image/jpeg")                        return ContentType::IMAGE_JPEG;
+        if (key == "image/webp")                        return ContentType::IMAGE_WEBP;
+        if (key == "image/gif")                         return ContentType::IMAGE_GIF;
+        if (key == "image/svg+xml")                     return ContentType::IMAGE_SVG;
+        if (key == "application/xml")                   return ContentType::APPLICATION_XML;
+        if (key == "application/pdf")                   return ContentType::APPLICATION_PDF;
+        if (key == "application/octet-stream")          return ContentType::OCTET_STREAM;
+
+        return ContentType::UNKNOWN;
     }
 }
-

@@ -1,0 +1,15 @@
+{
+  "command": [
+    "wrk",
+    "-t4",
+    "-c128",
+    "-d30s",
+    "--latency",
+    "http://127.0.0.1:8080/"
+  ],
+  "wall_seconds": 30.07808247199864,
+  "server_cpu_seconds": 420.48999999999995,
+  "average_server_cores": 13.979947039225571,
+  "threads": 20,
+  "rss_bytes": 9121792
+}

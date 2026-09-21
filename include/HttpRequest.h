@@ -1,64 +1,55 @@
 /**
  * @file HttpRequest.h
- * @brief Represents a parsed HTTP/1.1 request
- *
- * HttpParser fills this struct from raw TCP bytes.
- * Route handlers receive it as a const reference — read only.
- *
- * Example:
- *   void handle(const HttpRequest& req, HttpResponse& res) {
- *       auto id    = req.param("id");        // route param  /users/:id
- *       auto page  = req.q("page");          // query string ?page=2
- *       auto token = req.header("Authorization");
- *       auto body  = req.body;               // raw request body
- *   }
+ * @brief Represents a parsed HTTP/1.1 request using zero-allocation views.
  */
 
 #pragma once
 #include "HttpTypes.h"
 #include <string>
-#include <unordered_map>
+#include <string_view>
+
 namespace octane 
 {
     struct HttpRequest {
+        std::size_t      content_length = 0;
+        bool             keep_alive     = true;
 
-        // ── Core fields ───────────────────────────────
-        HttpMethod  method       = HttpMethod::UNKNOWN;   // GET, POST, PUT etc
-        std::string path;                                  // /users/42
-        std::string http_version = "HTTP/1.1";            // HTTP version string
-        std::string body;                                  // raw request body
-        ContentType content_type = ContentType::UNKNOWN;  // parsed Content-Type
+        HttpMethod       method         = HttpMethod::UNKNOWN;
+        std::string_view path;
+        std::string_view http_version   = "HTTP/1.1";
+        std::string      body;
+        ContentType      content_type   = ContentType::UNKNOWN;
 
-        // ── Parsed collections ────────────────────────
-        std::unordered_map<std::string, std::string> params;   // route params  :id → "42"
-        std::unordered_map<std::string, std::string> headers;  // request headers
-        std::unordered_map<std::string, std::string> query;    // query string  ?page=2
-        std::unordered_map<std::string, std::string> cookies;  // parsed cookies
+        StringMap params;
+        HeaderMap headers;
+        StringMap query;
+        StringMap cookies;
 
-        // ── Helpers ───────────────────────────────────
-
-        const std::string& param(const std::string& k, const std::string& fb = "") const {
-            auto it = params.find(k); return it != params.end() ? it->second : fb;
+        [[nodiscard]] std::string_view param(std::string_view k, std::string_view fb = {}) const noexcept {
+            auto it = params.find(k);
+            return it != params.end() ? it->second : fb;
         }
 
-        const std::string& q(const std::string& k, const std::string& fb = "") const {
-            auto it = query.find(k); return it != query.end() ? it->second : fb;
+        [[nodiscard]] std::string_view q(std::string_view k, std::string_view fb = {}) const noexcept {
+            auto it = query.find(k);
+            return it != query.end() ? it->second : fb;
         }
 
-        const std::string& header(const std::string& k, const std::string& fb = "") const {
-            auto it = headers.find(k); return it != headers.end() ? it->second : fb;
+        [[nodiscard]] std::string_view header(std::string_view k, std::string_view fb = {}) const noexcept {
+            auto it = headers.find(k);
+            return it != headers.end() ? it->second : fb;
         }
 
-        const std::string& cookie(const std::string& k, const std::string& fb = "") const {
-            auto it = cookies.find(k); return it != cookies.end() ? it->second : fb;
+        [[nodiscard]] std::string_view cookie(std::string_view k, std::string_view fb = {}) const noexcept {
+            auto it = cookies.find(k);
+            return it != cookies.end() ? it->second : fb;
         }
 
-        // ── Content-Type helpers ──────────────────────
-        bool is_json()      const { return content_type == ContentType::APPLICATION_JSON; }
-        bool is_form()      const { return content_type == ContentType::APPLICATION_FORM_URLENCODED; }
-        bool is_multipart() const { return content_type == ContentType::MULTIPART_FORM_DATA; }
-        bool is_html()      const { return content_type == ContentType::TEXT_HTML; }
-        bool is_text()      const { return content_type == ContentType::TEXT_PLAIN; }
-        bool has_body()     const { return !body.empty(); }
+        [[nodiscard]] bool is_json()      const noexcept { return content_type == ContentType::APPLICATION_JSON; }
+        [[nodiscard]] bool is_form()      const noexcept { return content_type == ContentType::APPLICATION_FORM_URLENCODED; }
+        [[nodiscard]] bool is_multipart() const noexcept { return content_type == ContentType::MULTIPART_FORM_DATA; }
+        [[nodiscard]] bool is_html()      const noexcept { return content_type == ContentType::TEXT_HTML; }
+        [[nodiscard]] bool is_text()      const noexcept { return content_type == ContentType::TEXT_PLAIN; }
+        [[nodiscard]] bool has_body()     const noexcept { return !body.empty(); }
     };
 }

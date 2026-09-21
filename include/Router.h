@@ -1,25 +1,6 @@
 /**
  * @file Router.h
- * @brief Two-tier HTTP request router for Octane
- *
- * Routes are registered at startup and resolved on every request.
- * Uses two lookup strategies depending on route type:
- *
- *  Tier 1 — static hash map  O(1)
- *    Exact paths: /users  /health  /api/status
- *    Covers ~95% of typical traffic
- *
- *  Tier 2 — trie             O(k) where k = number of path segments
- *    Parameterised paths: /users/:id  /posts/:id/comments/:commentId
- *    Captures param values into req.params
- *
- * Built once at startup on a single thread.
- * Fully thread safe at runtime — immutable after listen().
- * No locks needed.
- *
- * Usage:
- *   router.get("/users",     handler);   // static  → hash map
- *   router.get("/users/:id", handler);   // dynamic → trie
+ * @brief Memory-safe, zero-allocation two-tier HTTP router for Octane.
  */
 
 #pragma once
@@ -28,77 +9,83 @@
 #include "HttpResponse.h"
 #include "HttpTypes.h"
 #include <unordered_map>
+#include <string_view>
 #include <string>
+#include <deque>
+#include <array>
 
 namespace octane
 {
     class Router {
-        public:
+    public:
+        void add(std::string_view method,
+                 std::string_view path,
+                 Handler handler) {
+            HttpMethod m = stringToMethod(method);
+            if (m == HttpMethod::UNKNOWN) return;
 
-            // ── Route Registration ───────────────────────
+            size_t idx = static_cast<size_t>(m);
 
-            void add(const std::string& method,
-                    const std::string& path,
-                    Handler            handler) {
-                std::string key = makeKey(method, path);
-                if (isDynamic(path))
-                    dynamic_.insert(key, std::move(handler));
-                else
-                    static_[key] = std::move(handler);
+            if (isDynamic(path)) {
+                dynamic_[idx].insert(std::string(path), std::move(handler));
+            } else {
+                // std::deque ensures stable references upon push_back (no reallocation pointer invalidation)
+                path_storage_.emplace_back(path);
+                std::string_view persistent_view = path_storage_.back();
+                static_routes_[idx][persistent_view] = std::move(handler);
+            }
+        }
+
+        void get    (std::string_view path, Handler h) { add("GET",     path, std::move(h)); }
+        void post   (std::string_view path, Handler h) { add("POST",    path, std::move(h)); }
+        void put    (std::string_view path, Handler h) { add("PUT",     path, std::move(h)); }
+        void patch  (std::string_view path, Handler h) { add("PATCH",   path, std::move(h)); }
+        void del    (std::string_view path, Handler h) { add("DELETE",  path, std::move(h)); }
+        void options(std::string_view path, Handler h) { add("OPTIONS", path, std::move(h)); }
+        void head   (std::string_view path, Handler h) { add("HEAD",    path, std::move(h)); }
+
+        bool resolve(HttpRequest& req, HttpResponse& res) {
+            size_t method_idx = static_cast<size_t>(req.method);
+            if (method_idx >= 7) return false;
+
+            // 1. Static O(1) direct match
+            const auto& method_map = static_routes_[method_idx];
+            auto it = method_map.find(req.path);
+            if (it != method_map.end()) {
+                it->second(req, res);
+                return true;
             }
 
-            void get    (const std::string& path, Handler h) { add("GET",     path, std::move(h)); }
-            void post   (const std::string& path, Handler h) { add("POST",    path, std::move(h)); }
-            void put    (const std::string& path, Handler h) { add("PUT",     path, std::move(h)); }
-            void patch  (const std::string& path, Handler h) { add("PATCH",   path, std::move(h)); }
-            void del    (const std::string& path, Handler h) { add("DELETE",  path, std::move(h)); }
-            void options(const std::string& path, Handler h) { add("OPTIONS", path, std::move(h)); }
-            void head   (const std::string& path, Handler h) { add("HEAD",    path, std::move(h)); }
-
-            // ── Route Resolution ─────────────────────────
-
-            bool resolve(HttpRequest& req, HttpResponse& res) {
-                std::string key = makeKey(methodToString(req.method), req.path);
-
-                // 1. static lookup — O(1)
-                auto it = static_.find(key);
-                if (it != static_.end()) {
-                    it->second(req, res);
-                    return true;
-                }
-
-                // 2. dynamic lookup — O(k)
-                Handler matched;
-                if (dynamic_.search(key, matched, req.params)) {
-                    matched(req, res);
-                    return true;
-                }
-                return false;
+            // 2. Trie lookup for parameterized segments
+            Handler matched = nullptr;
+            if (dynamic_[method_idx].search(req.path, matched, req.params)) {
+                matched(req, res);
+                return true;
             }
 
-        private:
-            std::unordered_map<std::string, Handler> static_;  // O(1)  exact paths
-            Trie                                     dynamic_; // O(k)  parameterised paths
-            static std::string makeKey(const std::string& method,
-                                        const std::string& path) {
-                return method + ":" + path;
-            }
+            return false;
+        }
 
-            static bool isDynamic(const std::string& path) {
-                return path.find(':') != std::string::npos;
-            }
+    private:
+        using MethodStaticMap = std::unordered_map<std::string_view, Handler, StringViewHash, std::equal_to<>>;
+        
+        std::array<MethodStaticMap, 8> static_routes_;
+        std::array<Trie, 8>            dynamic_;
+        std::deque<std::string>        path_storage_;
 
-            static std::string methodToString(HttpMethod m) {
-                switch (m) {
-                    case HttpMethod::GET:     return "GET";
-                    case HttpMethod::POST:    return "POST";
-                    case HttpMethod::PUT:     return "PUT";
-                    case HttpMethod::PATCH:   return "PATCH";
-                    case HttpMethod::DEL:     return "DELETE";
-                    case HttpMethod::OPTIONS: return "OPTIONS";
-                    case HttpMethod::HEAD:    return "HEAD";
-                    default:                  return "UNKNOWN";
-                }
-            }
+        static bool isDynamic(std::string_view path) noexcept {
+            return path.find(':') != std::string_view::npos;
+        }
+
+        static HttpMethod stringToMethod(std::string_view m) noexcept {
+            if (m == "GET")     return HttpMethod::GET;
+            if (m == "POST")    return HttpMethod::POST;
+            if (m == "PUT")     return HttpMethod::PUT;
+            if (m == "PATCH")   return HttpMethod::PATCH;
+            if (m == "DELETE")  return HttpMethod::DEL;
+            if (m == "OPTIONS") return HttpMethod::OPTIONS;
+            if (m == "HEAD")    return HttpMethod::HEAD;
+            return HttpMethod::UNKNOWN;
+        }
     };
 }

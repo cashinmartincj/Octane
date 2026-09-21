@@ -1,114 +1,130 @@
 /**
  * @file HttpResponse.h
- * @brief Represents an HTTP/1.1 response built by route handlers
- *
- * All setters are chainable:
- *   res.status(200).json("{\"ok\":true}");
- *   res.status(404).text("not found");
- *   res.status(200).html_view(file.view());  // zero copy mmap
+ * @brief Zero-allocation structured response with optional full-serialization support.
  */
 
 #pragma once
 #include <string>
+#include <string_view>
 #include <unordered_map>
+#include <stdexcept>
 #include "HttpTypes.h"
 
 namespace octane
 {
-    inline const std::unordered_map<ContentType, std::string> content_type_str = {
-        { ContentType::TEXT_PLAIN,                  "text/plain" },
-        { ContentType::TEXT_HTML,                   "text/html" },
-        { ContentType::TEXT_CSS,                    "text/css" },
-        { ContentType::TEXT_JAVASCRIPT,             "text/javascript" },
-        { ContentType::APPLICATION_JSON,            "application/json" },
-        { ContentType::APPLICATION_XML,             "application/xml" },
-        { ContentType::APPLICATION_FORM_URLENCODED, "application/x-www-form-urlencoded" },
-        { ContentType::MULTIPART_FORM_DATA,         "multipart/form-data" },
-        { ContentType::IMAGE_JPEG,                  "image/jpeg" },
-        { ContentType::IMAGE_PNG,                   "image/png" },
-        { ContentType::IMAGE_WEBP,                  "image/webp" },
-        { ContentType::APPLICATION_PDF,             "application/pdf" },
-        { ContentType::OCTET_STREAM,                "application/octet-stream" },
-    };
+    inline constexpr std::string_view get_content_type_sv(ContentType type) noexcept {
+        switch (type) {
+            case ContentType::TEXT_PLAIN:                  return "text/plain";
+            case ContentType::TEXT_HTML:                   return "text/html";
+            case ContentType::TEXT_CSS:                    return "text/css";
+            case ContentType::TEXT_JAVASCRIPT:             return "text/javascript";
+            case ContentType::APPLICATION_JSON:            return "application/json";
+            case ContentType::APPLICATION_XML:             return "application/xml";
+            case ContentType::APPLICATION_FORM_URLENCODED: return "application/x-www-form-urlencoded";
+            case ContentType::MULTIPART_FORM_DATA:         return "multipart/form-data";
+            case ContentType::IMAGE_JPEG:                  return "image/jpeg";
+            case ContentType::IMAGE_PNG:                   return "image/png";
+            case ContentType::IMAGE_GIF:                   return "image/gif";
+            case ContentType::IMAGE_WEBP:                  return "image/webp";
+            case ContentType::IMAGE_SVG:                   return "image/svg+xml";
+            case ContentType::APPLICATION_PDF:             return "application/pdf";
+            case ContentType::OCTET_STREAM:                return "application/octet-stream";
+            default:                                       return "application/octet-stream";
+        }
+    }
 
-    /**
-     * @brief Maps HTTP status code to reason phrase
-     * e.g. 404 → "Not Found"
-     */
-    inline const std::unordered_map<int, std::string> status_text_str = {
-        { 200, "OK" },
-        { 201, "Created" },
-        { 204, "No Content" },
-        { 301, "Moved Permanently" },
-        { 302, "Found" },
-        { 400, "Bad Request" },
-        { 401, "Unauthorized" },
-        { 403, "Forbidden" },
-        { 404, "Not Found" },
-        { 405, "Method Not Allowed" },
-        { 500, "Internal Server Error" },
-    };
+    inline constexpr std::string_view get_status_text_sv(int code) noexcept {
+        switch (code) {
+            case 200: return "OK";
+            case 201: return "Created";
+            case 204: return "No Content";
+            case 301: return "Moved Permanently";
+            case 302: return "Found";
+            case 304: return "Not Modified";
+            case 400: return "Bad Request";
+            case 401: return "Unauthorized";
+            case 403: return "Forbidden";
+            case 404: return "Not Found";
+            case 405: return "Method Not Allowed";
+            case 413: return "Content Too Large";
+            case 417: return "Expectation Failed";
+            case 431: return "Request Header Fields Too Large";
+            case 500: return "Internal Server Error";
+            case 501: return "Not Implemented";
+            case 505: return "HTTP Version Not Supported";
+            default:  return "Unknown";
+        }
+    }
 
     struct HttpResponse {
-
         int         status_code  = 200;
         ContentType content_type = ContentType::TEXT_PLAIN;
+        
         std::unordered_map<std::string, std::string> headers;
 
-        // ── Three body storage strategies ────────────
-        // Dynamic: generated at runtime — JSON, error messages
-        // Owned:   loaded into memory   — read_file()
-        // Mapped:  zero copy mmap       — MappedFile::view()
         enum class BodyType { Dynamic, Owned, Mapped } body_type = BodyType::Dynamic;
 
-        std::string      body;         // dynamic body
-        std::string      owned_body;   // owned copy (read_file)
-        std::string_view mapped_body;  // zero copy view into mmap memory
+        std::string      body;
+        std::string      owned_body;
+        std::string_view mapped_body;
         bool             is_mapped = false;
 
-        // ── Chainable setters — dynamic body ─────────
+        HttpResponse& status(int code) noexcept { status_code = code; return *this; }
+        
+        HttpResponse& json(std::string_view data) { 
+            body.assign(data); 
+            body_type = BodyType::Dynamic; 
+            content_type = ContentType::APPLICATION_JSON; 
+            return *this; 
+        }
 
-        HttpResponse& status(int code) { status_code = code; return *this; }
-        HttpResponse& json  (const std::string& data) { body = data; content_type = ContentType::APPLICATION_JSON; return *this; }
-        HttpResponse& html  (const std::string& data) { body = data; content_type = ContentType::TEXT_HTML;        return *this; }
-        HttpResponse& text  (const std::string& data) { body = data; content_type = ContentType::TEXT_PLAIN;       return *this; }
-        HttpResponse& send  (const std::string& data) { body = data; return *this; }
-        HttpResponse& image (const std::string& data, ContentType type) { body = data; content_type = type; return *this; }
-        HttpResponse& header(const std::string& key, const std::string& val) { headers[key] = val; return *this; }
+        HttpResponse& html(std::string_view data) { 
+            body.assign(data); 
+            body_type = BodyType::Dynamic; 
+            content_type = ContentType::TEXT_HTML; 
+            return *this; 
+        }
 
-        // ── Chainable setters — zero copy mmap body ──
+        HttpResponse& text(std::string_view data) { 
+            body.assign(data); 
+            body_type = BodyType::Dynamic; 
+            content_type = ContentType::TEXT_PLAIN; 
+            return *this; 
+        }
 
-        /**
-         * @brief Respond with HTML from mmap memory — zero copy
-         * @param data  string_view into MappedFile memory
-         */
-        HttpResponse& html_view(std::string_view data) {
-            content_type = ContentType::TEXT_HTML;
-            mapped_body  = data;
-            body_type    = BodyType::Mapped;
+        HttpResponse& send(std::string_view data) { 
+            body.assign(data); 
+            body_type = BodyType::Dynamic; 
+            return *this; 
+        }
+
+        HttpResponse& image(std::string_view data, ContentType type) { 
+            body.assign(data); 
+            body_type = BodyType::Dynamic; 
+            content_type = type; 
+            return *this; 
+        }
+
+        HttpResponse& header(const std::string& key, const std::string& val) { 
+            headers[key] = val; 
+            return *this; 
+        }
+
+        HttpResponse& html_view(std::string_view data) noexcept {
+            content_type = ContentType::TEXT_HTML; 
+            mapped_body = data; 
+            body_type = BodyType::Mapped; 
             return *this;
         }
 
-        /**
-         * @brief Respond with image from mmap memory — zero copy
-         * @param data  string_view into MappedFile memory
-         * @param ct    Image ContentType e.g. ContentType::IMAGE_PNG
-         */
-        HttpResponse& image_view(std::string_view data, ContentType ct) {
-            content_type = ct;
-            mapped_body  = data;
-            body_type    = BodyType::Mapped;
+        HttpResponse& image_view(std::string_view data, ContentType ct) noexcept {
+            content_type = ct; 
+            mapped_body = data; 
+            body_type = BodyType::Mapped; 
             return *this;
         }
 
-        /**
-         * @brief Returns the active body based on BodyType
-         *
-         * Dynamic → body
-         * Owned   → owned_body
-         * Mapped  → mapped_body (zero copy mmap view)
-         */
-        std::string_view active_body() const {
+        [[nodiscard]] std::string_view active_body() const noexcept {
             switch (body_type) {
                 case BodyType::Dynamic: return std::string_view(body);
                 case BodyType::Owned:   return std::string_view(owned_body);
@@ -117,33 +133,67 @@ namespace octane
             }
         }
 
-        /**
-         * @brief Serialize response to raw HTTP/1.1 bytes
-         *
-         * Builds the full response string:
-         *   status line + headers + blank line + body
-         *
-         * Always includes Connection: keep-alive for persistent connections.
-         *
-         * @return Complete HTTP/1.1 response as std::string
-         */
-        std::string serialize() const {
-            auto sit   = status_text_str.find(status_code);
-            auto stext = sit != status_text_str.end() ? sit->second : "Unknown";
+        [[nodiscard]] std::string serialize_headers(bool close = false) const {
+            if (status_code < 200 || status_code > 599) throw std::invalid_argument("Unsupported response status");
+            std::string_view stext = get_status_text_sv(status_code);
             auto body_ret = active_body();
 
             std::string response;
-            response += "HTTP/1.1 " + std::to_string(status_code) + " " + stext + "\r\n";
-            response += "Content-Type: " + content_type_str.at(content_type) + "\r\n";
-            response += "Content-Length: " + std::to_string(body_ret.size()) + "\r\n";
-            response += "Connection: keep-alive\r\n";
-            response += "Keep-Alive: timeout=5\r\n";
-            for (auto& [key, val] : headers)
-                response += key + ": " + val + "\r\n";
-            response += "\r\n";
-            response += body_ret;
+            response.reserve(256);
+            
+            response.append("HTTP/1.1 ").append(std::to_string(status_code)).append(" ").append(stext).append("\r\n");
+            
+            bool custom_content_type = false;
+            for (const auto& [key, val] : headers) {
+                if (key.size() == 12 && 
+                    (key[0] == 'c' || key[0] == 'C') && 
+                    CaseInsensitiveEqual{}(key, "content-type")) {
+                    custom_content_type = true;
+                    break;
+                }
+            }
+                
+            if (!custom_content_type) {
+                response.append("Content-Type: ").append(get_content_type_sv(content_type)).append("\r\n");
+            }
+                
+            if (status_code != 204 && status_code != 304) {
+                response.append("Content-Length: ").append(std::to_string(body_ret.size())).append("\r\n");
+            }
+                
+            response.append(close ? "Connection: close\r\n" : "Connection: keep-alive\r\n");
+            
+            for (const auto& [key, val] : headers) {
+                if (CaseInsensitiveEqual{}(key, "content-length") || 
+                    CaseInsensitiveEqual{}(key, "transfer-encoding") ||
+                    CaseInsensitiveEqual{}(key, "connection")) continue;
+                response.append(key).append(": ").append(val).append("\r\n");
+            }
+            
+            response.append("\r\n");
             return response;
+        }
+
+        // Full serialization for testing, dispatchers, and monolithic writes
+        std::string serialize(bool close = false, bool head = false) const {
+            std::string full = serialize_headers(close);
+            if (!head && status_code != 204 && status_code != 304) {
+                full.append(active_body());
+            }
+            return full;
+        }
+
+        // Test utility conveniences matching serialized representations
+        bool starts_with(std::string_view prefix) const {
+            return serialize().starts_with(prefix);
+        }
+
+        std::size_t find(std::string_view needle) const {
+            return serialize().find(needle);
+        }
+
+        operator std::string() const {
+            return serialize();
         }
     };
 }
-

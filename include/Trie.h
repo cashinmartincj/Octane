@@ -1,96 +1,131 @@
 /**
  * @file Trie.h
- * @brief Prefix trie for O(k) dynamic URL route matching
- *
- *   root
- *    ├── "users"          → handler ✓
- *    │      ├── "ids"     → handler ✓  (static beats wildcard)
- *    │      └── :id       → handler ✓  (captures value)
- *    │            └── "posts" → handler ✓
- *    └── "health"
- *           └── :ui       → handler ✓
- *
- * Built once at startup — thread safe at runtime.
+ * @brief Prefix trie for zero-allocation dynamic URL route matching.
  */
 
 #pragma once
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <memory>
 #include <optional>
 #include <vector>
+#include <utility>
 #include "HttpTypes.h"
 
 namespace octane
 {
     struct TrieNode {
-        std::unordered_map<std::string, std::unique_ptr<TrieNode>> children;
+        // Linear array for child branches (faster than hash map for typical route fan-out <= 8)
+        std::vector<std::pair<std::string, std::unique_ptr<TrieNode>>> linear_children;
+        
+        // Hash map fallback for wide branching (> 8 static subroutes)
+        std::unordered_map<std::string, std::unique_ptr<TrieNode>, StringViewHash, std::equal_to<>> map_children;
+
         std::unique_ptr<TrieNode> wildcard;
         std::string               wildcard_name;
         std::optional<Handler>    handler;
+
+        [[nodiscard]] const TrieNode* find_child(std::string_view part) const noexcept {
+            if (!map_children.empty()) {
+                auto it = map_children.find(part);
+                return (it != map_children.end()) ? it->second.get() : nullptr;
+            }
+            for (const auto& [seg, child] : linear_children) {
+                if (seg == part) return child.get();
+            }
+            return nullptr;
+        }
+
+        TrieNode* get_or_create_child(std::string_view part) {
+            for (auto& [seg, child] : linear_children) {
+                if (seg == part) return child.get();
+            }
+            if (map_children.empty() && linear_children.size() < 8) {
+                linear_children.emplace_back(std::string(part), std::make_unique<TrieNode>());
+                return linear_children.back().second.get();
+            }
+            // Migrate to map if fanout becomes large
+            if (map_children.empty()) {
+                for (auto& [seg, child] : linear_children) {
+                    map_children.emplace(seg, std::move(child));
+                }
+                linear_children.clear();
+            }
+            auto& node = map_children[std::string(part)];
+            if (!node) node = std::make_unique<TrieNode>();
+            return node.get();
+        }
     };
 
     class Trie {
-        public:
-            void insert(const std::string& path, Handler handler) {
-                auto parts   = split(path, '/');
-                TrieNode* node = &root_;
+    public:
+        void insert(const std::string& path, Handler handler) {
+            TrieNode* node = &root_;
+            std::size_t start = 0;
+            const std::size_t len = path.size();
 
-                for (auto& part : parts) {
-                    if (part.empty()) continue;
-                    if (part[0] == ':') {
-                        if (!node->wildcard)
-                            node->wildcard = std::make_unique<TrieNode>();
-                        node->wildcard_name = part.substr(1);
-                        node = node->wildcard.get();
-                    } else {
-                        if (!node->children.count(part))
-                            node->children[part] = std::make_unique<TrieNode>();
-                        node = node->children[part].get();
+            while (start < len) {
+                while (start < len && path[start] == '/') ++start;
+                if (start >= len) break;
+
+                std::size_t end = path.find('/', start);
+                if (end == std::string::npos) end = len;
+
+                std::string_view part = std::string_view(path).substr(start, end - start);
+                start = end;
+
+                if (part.empty()) continue;
+
+                if (part[0] == ':') {
+                    if (!node->wildcard) {
+                        node->wildcard = std::make_unique<TrieNode>();
                     }
+                    node->wildcard_name = std::string(part.substr(1));
+                    node = node->wildcard.get();
+                } else {
+                    node = node->get_or_create_child(part);
                 }
-                node->handler = std::move(handler);
+            }
+            node->handler = std::move(handler);
+        }
+
+        [[nodiscard]] bool search(std::string_view path,
+                                  Handler& out_handler,
+                                  StringMap& params) const noexcept {
+            const TrieNode* node = &root_;
+            std::size_t start = 0;
+            const std::size_t len = path.size();
+
+            while (start < len) {
+                while (start < len && path[start] == '/') ++start;
+                if (start >= len) break;
+
+                std::size_t end = path.find('/', start);
+                if (end == std::string::npos) end = len;
+
+                std::string_view part = path.substr(start, end - start);
+                start = end;
+
+                if (part.empty()) continue;
+
+                const TrieNode* next = node->find_child(part);
+                if (next) {
+                    node = next;
+                } else if (node->wildcard) {
+                    params[node->wildcard_name] = part;
+                    node = node->wildcard.get();
+                } else {
+                    return false;
+                }
             }
 
-            // Returns false if no route matched (caller sends 404)
-            bool search(const std::string& path,
-                        Handler& out_handler,
-                        std::unordered_map<std::string, std::string>& params) const {
+            if (!node->handler) return false;
+            out_handler = *node->handler;
+            return true;
+        }
 
-                auto parts = split(path, '/');
-                const TrieNode* node = &root_;
-
-                for (auto& part : parts) {
-                    if (part.empty()) continue;
-
-                    auto it = node->children.find(part);
-                    if (it != node->children.end()) {
-                        node = it->second.get();
-                    } else if (node->wildcard) {
-                        params[node->wildcard_name] = part;
-                        node = node->wildcard.get();
-                    } else {
-                        return false;
-                    }
-                }
-
-                if (!node->handler) return false;
-                out_handler = *node->handler;
-                return true;
-            }
-
-        private:
-            TrieNode root_;
-
-            static std::vector<std::string> split(const std::string& s, char delim) {
-                std::vector<std::string> parts;
-                std::string current;
-                for (char c : s) {
-                    if (c == delim) { parts.push_back(current); current.clear(); }
-                    else current += c;
-                }
-                if (!current.empty()) parts.push_back(current);
-                return parts;
-            }
-        };
-}
+    private:
+        TrieNode root_;
+    };
+} // namespace octane

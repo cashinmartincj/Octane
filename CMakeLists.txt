@@ -57,3 +57,44 @@ install(EXPORT OctaneTargets
     NAMESPACE Octane::
     DESTINATION lib/cmake/octane
 )
+include(CTest)
+if(BUILD_TESTING)
+    add_executable(octane_request_tests tests/request_dispatch.cpp)
+    target_link_libraries(octane_request_tests PRIVATE octane_lib)
+    add_test(NAME request_dispatch COMMAND octane_request_tests)
+endif()
+
+option(OCTANE_SANITIZERS "Enable AddressSanitizer and UndefinedBehaviorSanitizer" OFF)
+if(OCTANE_SANITIZERS)
+    target_compile_options(octane_lib PUBLIC -fsanitize=address,undefined -fno-omit-frame-pointer)
+    target_link_options(octane_lib PUBLIC -fsanitize=address,undefined)
+endif()
+
+if(BUILD_TESTING)
+    add_executable(octane_parser_tests tests/http_parser.cpp)
+    target_link_libraries(octane_parser_tests PRIVATE octane_lib)
+    add_test(NAME http_parser COMMAND octane_parser_tests)
+    add_executable(octane_server_fixture tests/server_fixture.cpp)
+    target_link_libraries(octane_server_fixture PRIVATE octane_lib)
+    find_package(Python3 REQUIRED COMPONENTS Interpreter)
+    add_test(NAME tcp_transport COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/transport_test.py $<TARGET_FILE:octane_server_fixture>)
+    set_tests_properties(tcp_transport PROPERTIES TIMEOUT 20)
+endif()
+
+option(OCTANE_FUZZING "Build Clang libFuzzer HTTP parser target" OFF)
+if(OCTANE_FUZZING)
+    if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+        message(FATAL_ERROR "OCTANE_FUZZING requires Clang")
+    endif()
+    add_executable(octane_fuzz_parser tests/fuzz_parser.cpp)
+    target_link_libraries(octane_fuzz_parser PRIVATE octane_lib)
+    target_compile_options(octane_fuzz_parser PRIVATE -fsanitize=fuzzer,address,undefined -fno-omit-frame-pointer)
+    target_link_options(octane_fuzz_parser PRIVATE -fsanitize=fuzzer,address,undefined)
+endif()
+
+if(BUILD_TESTING)
+    add_test(NAME benchmark_smoke COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/benchmark_smoke.py $<TARGET_FILE:octane_server_fixture>)
+    set_tests_properties(benchmark_smoke PROPERTIES TIMEOUT 75 LABELS benchmark)
+endif()

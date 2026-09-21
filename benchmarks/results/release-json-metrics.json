@@ -1,0 +1,15 @@
+{
+  "command": [
+    "wrk",
+    "-t4",
+    "-c128",
+    "-d30s",
+    "--latency",
+    "http://127.0.0.1:8080/api/hello"
+  ],
+  "wall_seconds": 30.0491050779965,
+  "server_cpu_seconds": 417.61,
+  "average_server_cores": 13.897585266384374,
+  "threads": 20,
+  "rss_bytes": 9449472
+}

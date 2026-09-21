@@ -1,0 +1,5 @@
+GET /?x=a%20b HTTP/1.1
+Host: x
+Cookie: a=b
+Connection: close
+
