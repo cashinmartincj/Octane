@@ -1,5 +1,9 @@
 # HTTP Transport Limits and Verification
 
+For application API usage, start with [`usage.md`](usage.md). For Kubernetes,
+NGINX, runtime policy, probes, and rollout checks, see
+[`deployment.md`](deployment.md).
+
 Octane supports high-throughput, bounded Content-Length requests over HTTP/1.0 and HTTP/1.1.
 It is an optimized, low-latency microframework designed around a modern thread-per-core asynchronous execution architecture.
 The framing policy follows [RFC 9112](https://www.rfc-editor.org/rfc/rfc9112.html): ambiguous framing is rejected and the connection is closed. This implementation conservatively rejects all duplicate Content-Length fields, even identical ones. Transfer-Encoding is currently rejected with 501 (400 when combined with Content-Length). Expect requests receive 417; chunked decoding and 100-continue are future work. Only origin-form targets and `OPTIONS *` are supported. Host presence, duplicates, and unsafe delimiters are checked; full URI authority validation and proxy absolute-form handling are not implemented.
@@ -34,6 +38,15 @@ limits.shutdown_timeout = std::chrono::seconds(5);
 
 // Binds to port 8080 across 8 dedicated worker event loops
 app.listen(8080, 8, limits);
+```
+
+When a reverse proxy runs on the same machine, restrict the origin listener to
+loopback instead of exposing it on every interface:
+
+```cpp
+octane::transport::TcpServerOptions transport;
+transport.bind_address = "127.0.0.1";
+app.listen(8080, 8, limits, transport);
 ```
 
 These are the defaults. Header bytes include the request line and final CRLF. The read deadline covers an entire request, including its body, and also limits idle keep-alive time. Sending occasional bytes does not restart the deadline. Timeouts and incomplete socket reads close the connection. Header/body limit errors return 431/413 then close. Excess accepted connections are closed without starting a request. Limits are per connection, not a global memory budget: request storage, parsed maps, output strings, and application allocations add overhead. Application response size is not currently capped.

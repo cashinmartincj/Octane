@@ -6,6 +6,17 @@ Built on Linux `io_uring` with an isolated thread-per-core architecture (`SO_REU
 
 Performance needs to be measured for your workload. See the transport limits, supported protocol behavior, and reproducible checks below.
 
+## Documentation
+
+- **[Using Octane](docs/usage.md)** — dependencies, application setup, routing,
+  requests, responses, execution queues, static files, configuration, testing,
+  benchmarks, and common mistakes.
+- **[Deployment guide](docs/deployment.md)** — Kubernetes topology, Services,
+  gateways, NGINX placement, CPU sizing, `io_uring` policy, health checks,
+  graceful shutdown, security, observability, and rollout verification.
+- **[Transport hardening](docs/hardening.md)** — protocol rules, internal
+  execution model, operational tradeoffs, and verification details.
+
 ---
 
 ## Features
@@ -24,7 +35,7 @@ Performance needs to be measured for your workload. See the transport limits, su
 - **Zero-heap HTTP/1.1 parser** — request-line, headers, query string, and cookies as non-owning string views.
 - **Zero-copy static file serving** via virtual memory `mmap`.
 - **POST/PUT/PATCH body parsing** via two-phase Content-Length reads.
-- **Single include, two-line route registration**.
+- **Compact route registration** through CRTP classes or plain handlers.
 
 ---
 
@@ -91,6 +102,7 @@ Workers are pinned to CPUs from the process's allowed affinity mask by default, 
 
 ```cpp
 octane::transport::TcpServerOptions transport;
+transport.bind_address = "127.0.0.1"; // Restrict an NGINX origin to loopback.
 transport.pin_workers = true;
 transport.ring_queue_depth = 256;
 transport.execution_queues.shared_threads_per_shard = 1;
@@ -115,11 +127,25 @@ Execution queues are shard-local. With eight ring workers, a named configuration
 
 Only offloaded requests are materialized into owned raw request storage and reparsed on the queue worker, so their header, path, parameter, cookie, query, and body views remain valid. Responses are posted through an `eventfd` wakeup to the connection's owning ring. This copy, queue synchronization, and thread handoff make offloading inappropriate for trivial handlers; leave those inline.
 
-## Origin Deployment Behind NGINX or Cloudflare
+## Deployment model
 
-Octane is intended to run as an HTTP/1.1 origin behind a production edge rather than terminate public TLS directly. Keep the origin bound to a private interface, loopback address, firewall-restricted address, or Cloudflare Tunnel. Do not trust forwarding headers from arbitrary clients; accept them only when direct access to the origin is blocked.
+Octane is intended to run as an HTTP/1.1 origin behind a production edge rather than terminate public TLS directly. NGINX is not embedded in or required by the framework. In Kubernetes, the recommended topology is a maintained Gateway/controller routing to a ClusterIP Service backed by Octane-only Pods. Octane binds to `0.0.0.0` in that topology because the gateway is in another Pod. Use `127.0.0.1` only when the trusted proxy shares the same host or Pod network namespace.
+
+The complete operational guide, including Kubernetes examples and the request-framing contract, is in [`docs/deployment.md`](docs/deployment.md).
+
+### Same-host NGINX example
+
+Keep the origin bound to loopback or a firewall-restricted private address. Do not trust forwarding headers from arbitrary clients; accept them only when direct access to the origin is blocked.
 
 For NGINX, enable [request buffering](https://nginx.org/en/docs/http/ngx_http_proxy_module.html#proxy_request_buffering) and apply an edge body limit no larger than the application's configured limit. Preserve upstream keep-alive and forwarding metadata only from the trusted proxy:
+
+Bind Octane to loopback when NGINX runs on the same host:
+
+```cpp
+octane::transport::TcpServerOptions transport;
+transport.bind_address = "127.0.0.1";
+app.listen(8080, 8, limits, transport);
+```
 
 ```nginx
 location / {
@@ -135,6 +161,12 @@ location / {
 }
 ```
 
+A complete HTTP virtual-host template is available at
+[`deploy/nginx/octane.conf`](deploy/nginx/octane.conf). Replace its
+`server_name`, install it using your distribution's NGINX layout, validate with
+`nginx -t`, and reload NGINX. Add your normal TLS configuration before public
+deployment.
+
 Octane deliberately rejects chunked request bodies. Confirm that the selected proxy configuration buffers and forwards bodies with `Content-Length`; do not expose the origin until that behavior has been tested with the deployed proxy version.
 
 For [Cloudflare Tunnel](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/), point the local service at Octane's private HTTP listener and enable the [`disableChunkedEncoding`](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/configure-tunnels/origin-parameters/#disablechunkedencoding) origin option. Tunnel uses outbound-only connections, allowing inbound access to the origin to remain blocked. Use more than one tunnel connector where origin availability requires it.
@@ -142,23 +174,22 @@ For [Cloudflare Tunnel](https://developers.cloudflare.com/cloudflare-one/network
 ## Build
 
 ```bash
-git clone https://github.com/cashinmartincj/octane
-cd octane
-mkdir build && cd build
-cmake .. -DCMAKE_BUILD_TYPE=Release
-make -j$(nproc)
+git clone https://github.com/cashinmartincj/Octane.git
+cd Octane
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j"$(nproc)"
 ```
 
 To skip examples:
 
 ```bash
-cmake .. -DOCTANE_BUILD_EXAMPLES=OFF
+cmake -S . -B build -DOCTANE_BUILD_EXAMPLES=OFF
 ```
 
 To build a single example:
 
 ```bash
-cmake --build . --target hello_world
+cmake --build build --target hello_world
 ```
 
 ## Build and Regression Tests
@@ -227,7 +258,7 @@ wrk -t8 -c128 -d30s --latency http://127.0.0.1:8080/
 - `request_dispatch` and the real-socket `tcp_transport` regression tests passed.
 - The GCC ThreadSanitizer transport run passed after replacing asynchronous signal-handler state with a blocked-signal waiter and atomic stop flag.
 - Clang ASan/UBSan passed the request, transport, and benchmark tests with leak detection enabled.
-- All five CTest tests passed, including parser hardening, request dispatch, bounded execution queues, real TCP behavior, and the benchmark smoke test.
+- All six CTest tests passed, including parser hardening, request dispatch, server option validation, bounded execution queues, real TCP behavior, and the benchmark smoke test.
 - `benchmark_smoke` completed 2,000 GET and 2,000 4 KiB POST requests with zero reported errors.
 - A ten-second local Release `wrk` regression run (`-t8 -c256`) with execution queues compiled in measured about 615k inline GET requests/s, with approximately 429 us median and 0.74 ms p99 latency. The immediately preceding build without execution queues measured about 618k requests/s; that difference is within normal local-run variation. Loopback results are regression checks rather than capacity claims.
 - A longer Release soak completed approximately 17.55 million GETs over 30 seconds at 256 connections, followed by 128,000 persistent 4 KiB POSTs, with zero reported errors.
@@ -238,11 +269,12 @@ No multi-hour soak test or full HTTP conformance audit was performed for this re
 
 ```cpp
 #include "App.h"
+#include "RouteBase.h"
 
 class HelloWorld : public octane::routes::Get<HelloWorld> {
 public:
     void handle(const octane::HttpRequest& req, octane::HttpResponse& res) {
-        res.status(200).body("Hello, World!");
+        res.status(200).text("Hello, World!");
     }
 };
 
@@ -256,12 +288,15 @@ int main() {
 Or with `using namespace octane` to avoid prefixing:
 
 ```cpp
+#include "App.h"
+#include "RouteBase.h"
+
 using namespace octane;
 
 class HelloWorld : public routes::Get<HelloWorld> {
 public:
     void handle(const HttpRequest& req, HttpResponse& res) {
-        res.status(200).body("Hello, World!");
+        res.status(200).text("Hello, World!");
     }
 };
 
@@ -319,7 +354,10 @@ public:
 };
 ```
 
-Files are resolved relative to the executable directory.
+`MappedFile::open` uses the supplied path. Relative paths resolve from the
+process working directory; the HTML example explicitly calculates its
+executable directory before opening bundled assets. Mapped response storage
+must outlive the asynchronous write.
 
 ### Auth, Middleware & CORS
 
@@ -341,21 +379,26 @@ public:
 
 ### Supported HTTP Methods
 
-| Method | CRTP Base |
+| Method | Handler style |
 | --- | --- |
 | GET | `octane::routes::Get<T>` |
 | POST | `octane::routes::Post<T>` |
 | PUT | `octane::routes::Put<T>` |
 | PATCH | `octane::routes::Patch<T>` |
 | DELETE | `octane::routes::Del<T>` |
-| OPTIONS | `octane::routes::Options<T>` |
+| HEAD | Plain handler via `app.head(path, handler)` |
+| OPTIONS | Plain handler via `app.options(path, handler)` |
+
+Dedicated `routes::Head<T>` and `routes::Options<T>` convenience bases are not
+currently provided. See the [route guide](docs/usage.md#5-define-routes) for both
+supported handler styles.
 
 ## Project Structure
 
 ```text
 octane/
 ├── include/
-│   ├── App.h           # Thread pool, accept loop, entry point
+│   ├── App.h           # Application and route-registration facade
 │   ├── Router.h        # Hybrid static/dynamic router
 │   ├── Trie.h          # Trie for dynamic route matching
 │   ├── HttpParser.h    # Raw bytes → HttpRequest
@@ -372,6 +415,13 @@ octane/
 ├── examples/
 │   ├── 01_hello_world/
 │   └── 02_rest_api/
+├── docs/
+│   ├── usage.md
+│   ├── deployment.md
+│   └── hardening.md
+├── deploy/
+│   └── nginx/
+├── tests/
 ├── CMakeLists.txt
 ├── LICENSE
 └── README.md
@@ -381,15 +431,21 @@ octane/
 
 ```cmake
 include(FetchContent)
+set(OCTANE_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
 FetchContent_Declare(
     octane
-    GIT_REPOSITORY https://github.com/cashinmartincj/octane
-    GIT_TAG        v0.1.0
+    GIT_REPOSITORY https://github.com/cashinmartincj/Octane.git
+    GIT_TAG        v0.2.0
 )
 FetchContent_MakeAvailable(octane)
 
 target_link_libraries(your_app PRIVATE octane_lib)
 ```
+
+`BUILD_TESTING` is a project-wide CMake option; omit that assignment when the
+parent project intentionally enables tests. The complete consumer-project
+example is in [Using Octane](docs/usage.md#3-use-octane-from-another-cmake-project).
 
 ## License
 
