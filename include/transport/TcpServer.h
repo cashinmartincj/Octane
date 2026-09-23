@@ -13,6 +13,7 @@
 #include <memory>
 #include <mutex>
 #include <stdexcept>
+#include <string>
 #include <thread>
 #include <unordered_set>
 #include <vector>
@@ -21,6 +22,7 @@
 #include <signal.h>
 #include <unistd.h>
 #include <sys/socket.h>
+#include <arpa/inet.h>
 #include <netinet/in.h>
 
 namespace octane::transport {
@@ -28,11 +30,16 @@ namespace octane::transport {
 struct TcpServerOptions {
     unsigned int ring_queue_depth{256};
     bool pin_workers{true};
+    std::string bind_address{"0.0.0.0"};
     ExecutionQueueOptions execution_queues{};
 
     void validate() const {
         if (ring_queue_depth < 8)
             throw std::invalid_argument("io_uring queue depth must be at least 8");
+        in_addr parsed_address{};
+        if (bind_address.empty() ||
+            inet_pton(AF_INET, bind_address.c_str(), &parsed_address) != 1)
+            throw std::invalid_argument("bind_address must be a valid IPv4 address");
         if (!execution_queues.shared_threads_per_shard ||
             !execution_queues.shared_capacity)
             throw std::invalid_argument("Invalid shared execution queue configuration");
@@ -105,7 +112,7 @@ public:
 
             listening_sockets.reserve(num_threads_);
             for (size_t i = 0; i < num_threads_; ++i) {
-                int fd = create_listening_socket(port_);
+                int fd = create_listening_socket(port_, options_.bind_address);
                 listening_sockets.push_back(fd);
                 if (i == 0 && port_ == 0) port_ = socket_port(fd);
             }
@@ -196,7 +203,7 @@ private:
         return ntohs(address.sin_port);
     }
 
-    static int create_listening_socket(int port) {
+    static int create_listening_socket(int port, const std::string& bind_address) {
         int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
         if (fd < 0)
             throw std::runtime_error("socket failed: " +
@@ -213,7 +220,10 @@ private:
 
         sockaddr_in address{};
         address.sin_family = AF_INET;
-        address.sin_addr.s_addr = htonl(INADDR_ANY);
+        if (inet_pton(AF_INET, bind_address.c_str(), &address.sin_addr) != 1) {
+            ::close(fd);
+            throw std::invalid_argument("bind_address must be a valid IPv4 address");
+        }
         address.sin_port = htons(static_cast<uint16_t>(port));
         if (bind(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) < 0) {
             const int error = errno;

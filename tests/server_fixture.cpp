@@ -41,6 +41,7 @@ int main(int argc, char** argv) {
     router.get("/close", [](auto&, auto& res) { res.header("Connection", "close").text("bye"); });
     router.head("/", [](auto&, auto& res) { res.text("suppressed"); });
     octane::transport::TcpServerOptions options;
+    options.bind_address = "127.0.0.1";
     options.execution_queues.named.push_back({"database", 1, 32});
     octane::transport::TcpServer server(router, limits, options);
     server.listen(argc > 1 ? std::stoi(argv[1]) : 0, 4);
