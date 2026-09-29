@@ -22,7 +22,10 @@ else()
 endif()
 
 # ── library ───────────────────────────────────
-add_library(octane_lib src/FileHandle.cpp)
+add_library(octane_lib
+    src/FileHandle.cpp
+    src/utils/InputValidation.cpp
+)
 
 target_include_directories(octane_lib PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -73,6 +76,9 @@ if(BUILD_TESTING)
     add_executable(octane_request_tests tests/request_dispatch.cpp)
     target_link_libraries(octane_request_tests PRIVATE octane_lib)
     add_test(NAME request_dispatch COMMAND octane_request_tests)
+    add_executable(octane_input_validation_tests tests/input_validation.cpp)
+    target_link_libraries(octane_input_validation_tests PRIVATE octane_lib)
+    add_test(NAME input_validation COMMAND octane_input_validation_tests)
 endif()
 
 option(OCTANE_SANITIZERS "Enable AddressSanitizer and UndefinedBehaviorSanitizer" OFF)
