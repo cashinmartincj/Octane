@@ -1,6 +1,29 @@
 /**
  * @file HttpResponse.h
- * @brief Zero-allocation structured response with optional full-serialization support.
+ * @brief Zero-allocation structured HTTP response representation and serialization engine.
+ *
+ * @details
+ * `HttpResponse` encapsulates an HTTP/1.1 response status code, content type, headers,
+ * and body payload. It supports three distinct body storage models (`BodyType`):
+ * - `Dynamic`: Body stored in an internal `std::string` buffer (`res.json(...)`, `res.text(...)`).
+ * - `Owned`: Body moved into `owned_body` for async task transfers or offloaded execution queues.
+ * - `Mapped`: Zero-copy non-owning `std::string_view` referencing memory-mapped files or static assets
+ *   (`res.html_view(...)`, `res.image_view(...)`), avoiding heap allocation entirely.
+ *
+ * Header serialization produces standard RFC 9112 compliant HTTP/1.1 response framing,
+ * automatically computing `Content-Length` (omitted for 204 No Content and 304 Not Modified),
+ * setting `Connection: keep-alive` or `Connection: close`, and validating custom header names
+ * and values against RFC specifications.
+ *
+ * Where this is imported / used:
+ * - Direct Include: `#include "HttpResponse.h"` or via `#include "Octane.h"`
+ * - Handlers: Returned by value from all route handlers (`[](HttpRequest& req, HttpResponse& res) -> HttpResponse`)
+ * - Transport: Read by `octane::transport::TcpConnection` to emit response headers and body fragments to `io_uring`
+ * - Dispatcher: Used by `octane::core::RequestDispatcher` for synchronous and offloaded route fulfillment
+ * - Static Files: Combined with `FileHandle` to stream memory-mapped files without user-space buffer copies
+ *
+ * @author Octane Framework Team / FitOps Backend Core
+ * @date 2026
  */
 
 #pragma once
@@ -8,10 +31,18 @@
 #include <string_view>
 #include <unordered_map>
 #include <stdexcept>
+#include <utility>
 #include "HttpTypes.h"
 
 namespace octane
 {
+    /**
+     * @brief Translates an internal ContentType enum value into an RFC-compliant MIME string view.
+     * @param type ContentType enum variant.
+     * @return Canonical MIME type string literal (e.g., "application/json", "text/html").
+     *
+     * @note Executed at compile-time / zero-cost (`noexcept constexpr`).
+     */
     inline constexpr std::string_view get_content_type_sv(ContentType type) noexcept {
         switch (type) {
             case ContentType::TEXT_PLAIN:                  return "text/plain";
@@ -33,6 +64,11 @@ namespace octane
         }
     }
 
+    /**
+     * @brief Translates standard HTTP status codes into canonical RFC reason phrases.
+     * @param code Numeric HTTP status code (e.g., 200, 404, 500).
+     * @return Canonical reason phrase string literal (e.g., "OK", "Not Found").
+     */
     inline constexpr std::string_view get_status_text_sv(int code) noexcept {
         switch (code) {
             case 200: return "OK";
@@ -57,21 +93,59 @@ namespace octane
         }
     }
 
+    /**
+     * @struct HttpResponse
+     * @brief Fluent builder and container for outgoing HTTP/1.1 responses.
+     *
+     * @details
+     * Provides chainable setters (`.status(200).json(...)`) for constructing responses.
+     * Supports zero-copy memory-mapped file output via `.html_view(...)` or `.image_view(...)`,
+     * dynamic heap-backed bodies for JSON / text endpoints, and custom header definitions.
+     *
+     * Example usage in a route handler:
+     * @code
+     * app.get("/api/v1/health", [](HttpRequest& req, HttpResponse& res) -> HttpResponse {
+     *     return res.status(200).json(R"({"status":"ok"})");
+     * });
+     * @endcode
+     */
     struct HttpResponse {
+        /// HTTP status code (default: 200 OK)
         int         status_code  = 200;
+
+        /// Content-Type MIME category (default: TEXT_PLAIN)
         ContentType content_type = ContentType::TEXT_PLAIN;
         
+        /// Key-value map of custom response headers
         std::unordered_map<std::string, std::string> headers;
 
-        enum class BodyType { Dynamic, Owned, Mapped } body_type = BodyType::Dynamic;
+        /**
+         * @enum BodyType
+         * @brief Defines the internal memory ownership model of the response body.
+         */
+        enum class BodyType {
+            Dynamic, ///< Body is stored in the internal `std::string body` buffer.
+            Owned,   ///< Body is owned via `std::string owned_body` (transferred across threads).
+            Mapped   ///< Body is a borrowed `std::string_view` referencing mmap/static memory.
+        } body_type = BodyType::Dynamic;
 
-        std::string      body;
-        std::string      owned_body;
-        std::string_view mapped_body;
-        bool             is_mapped = false;
+        std::string      body;        ///< Standard heap-allocated dynamic response body
+        std::string      owned_body;  ///< Transferred/moved response payload for worker queues
+        std::string_view mapped_body; ///< Non-owning view pointing into mmap'd static files or literals
+        bool             is_mapped = false; ///< True if response body is memory mapped
 
+        /**
+         * @brief Sets the numeric HTTP status code.
+         * @param code Standard HTTP status code (200, 400, 404, 500, etc.).
+         * @return Fluent reference to `*this`.
+         */
         HttpResponse& status(int code) noexcept { status_code = code; return *this; }
         
+        /**
+         * @brief Sets response content type to application/json and copies data to body.
+         * @param data JSON string or string_view.
+         * @return Fluent reference to `*this`.
+         */
         HttpResponse& json(std::string_view data) { 
             body.assign(data); 
             body_type = BodyType::Dynamic; 
@@ -79,6 +153,11 @@ namespace octane
             return *this; 
         }
 
+        /**
+         * @brief Sets response content type to text/html and copies data to body.
+         * @param data HTML markup string.
+         * @return Fluent reference to `*this`.
+         */
         HttpResponse& html(std::string_view data) { 
             body.assign(data); 
             body_type = BodyType::Dynamic; 
@@ -86,6 +165,11 @@ namespace octane
             return *this; 
         }
 
+        /**
+         * @brief Sets response content type to text/plain and copies data to body.
+         * @param data Plain text string.
+         * @return Fluent reference to `*this`.
+         */
         HttpResponse& text(std::string_view data) { 
             body.assign(data); 
             body_type = BodyType::Dynamic; 
@@ -93,12 +177,23 @@ namespace octane
             return *this; 
         }
 
+        /**
+         * @brief Assigns raw data to response body without altering current content type.
+         * @param data Binary or string payload.
+         * @return Fluent reference to `*this`.
+         */
         HttpResponse& send(std::string_view data) { 
             body.assign(data); 
             body_type = BodyType::Dynamic; 
             return *this; 
         }
 
+        /**
+         * @brief Assigns image bytes and sets the appropriate image MIME content type.
+         * @param data Binary image buffer.
+         * @param type ContentType enum indicating image format (e.g., IMAGE_PNG, IMAGE_JPEG).
+         * @return Fluent reference to `*this`.
+         */
         HttpResponse& image(std::string_view data, ContentType type) { 
             body.assign(data); 
             body_type = BodyType::Dynamic; 
@@ -106,11 +201,23 @@ namespace octane
             return *this; 
         }
 
+        /**
+         * @brief Adds or replaces an HTTP response header.
+         * @param key Header name (case-insensitive in HTTP/1.1; checked during serialization).
+         * @param val Header value.
+         * @return Fluent reference to `*this`.
+         */
         HttpResponse& header(const std::string& key, const std::string& val) { 
             headers[key] = val; 
             return *this; 
         }
 
+        /**
+         * @brief Emits an HTML response from a non-owning string_view (zero copy).
+         * @details Useful for static pages or mmap'd assets. Caller must guarantee lifetime.
+         * @param data Valid HTML string view.
+         * @return Fluent reference to `*this`.
+         */
         HttpResponse& html_view(std::string_view data) noexcept {
             content_type = ContentType::TEXT_HTML; 
             mapped_body = data; 
@@ -118,6 +225,12 @@ namespace octane
             return *this;
         }
 
+        /**
+         * @brief Emits an image response from a non-owning string_view (zero copy).
+         * @param data Non-owning buffer pointing to memory-mapped image data.
+         * @param ct Image MIME enum type.
+         * @return Fluent reference to `*this`.
+         */
         HttpResponse& image_view(std::string_view data, ContentType ct) noexcept {
             content_type = ct; 
             mapped_body = data; 
@@ -125,15 +238,25 @@ namespace octane
             return *this;
         }
 
+        /**
+         * @brief Resolves the active body view based on current BodyType mode.
+         * @return std::string_view representing the active body bytes.
+         */
         [[nodiscard]] std::string_view active_body() const noexcept {
             switch (body_type) {
                 case BodyType::Dynamic: return std::string_view(body);
                 case BodyType::Owned:   return std::string_view(owned_body);
                 case BodyType::Mapped:  return mapped_body;
-                default:                return std::string_view(body);
+                default:                std::unreachable();
             }
         }
 
+        /**
+         * @brief Serializes HTTP/1.1 response status line and headers into a formatted string.
+         * @param close When true, sets `Connection: close`; otherwise `Connection: keep-alive`.
+         * @return Formatted HTTP/1.1 headers string ending with `\r\n\r\n`.
+         * @throws std::invalid_argument If status_code is outside [200, 599] or headers contain illegal chars.
+         */
         [[nodiscard]] std::string serialize_headers(bool close = false) const {
             if (status_code < 200 || status_code > 599) throw std::invalid_argument("Unsupported response status");
             std::string_view stext = get_status_text_sv(status_code);
@@ -178,6 +301,11 @@ namespace octane
             return response;
         }
 
+        /**
+         * @brief Validates that an HTTP header name complies with RFC 9110 token requirements.
+         * @param name Header field name.
+         * @return True if valid token characters only; false otherwise.
+         */
         [[nodiscard]] static bool valid_header_name(std::string_view name) noexcept {
             if (name.empty()) return false;
             for (unsigned char c : name) {
@@ -194,6 +322,11 @@ namespace octane
             return true;
         }
 
+        /**
+         * @brief Validates that an HTTP header value contains only permitted visible ASCII or tab characters.
+         * @param value Header value string.
+         * @return True if valid; false if contains control characters (CR, LF, NUL, DEL, etc.).
+         */
         [[nodiscard]] static bool valid_header_value(std::string_view value) noexcept {
             for (unsigned char c : value) {
                 if ((c < 32 && c != '\t') || c == 127) return false;
@@ -201,7 +334,12 @@ namespace octane
             return true;
         }
 
-        // Full serialization for testing, dispatchers, and monolithic writes
+        /**
+         * @brief Full serialization for testing, dispatchers, and monolithic socket writes.
+         * @param close Whether to append `Connection: close`.
+         * @param head Whether this is a HEAD request (omits body bytes, keeps headers).
+         * @return Complete serialized HTTP/1.1 message string.
+         */
         std::string serialize(bool close = false, bool head = false) const {
             std::string full = serialize_headers(close);
             if (!head && status_code != 204 && status_code != 304) {
@@ -210,15 +348,27 @@ namespace octane
             return full;
         }
 
-        // Test utility conveniences matching serialized representations
+        /**
+         * @brief Test utility checking if serialized response begins with a prefix.
+         * @param prefix Expected prefix (e.g., "HTTP/1.1 200 OK").
+         * @return True if prefix matches.
+         */
         bool starts_with(std::string_view prefix) const {
             return serialize().starts_with(prefix);
         }
 
+        /**
+         * @brief Test utility searching for a substring within serialized response.
+         * @param needle Substring to search for.
+         * @return Position if found, std::string::npos otherwise.
+         */
         std::size_t find(std::string_view needle) const {
             return serialize().find(needle);
         }
 
+        /**
+         * @brief Implicit string conversion operator for testing and debugging.
+         */
         operator std::string() const {
             return serialize();
         }

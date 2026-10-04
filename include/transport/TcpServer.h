@@ -1,3 +1,32 @@
+/**
+ * @file TcpServer.h
+ * @brief Multi-threaded Linux io_uring TCP server with SO_REUSEPORT and CPU core affinity pinning.
+ *
+ * @details
+ * `TcpServer` orchestrates the multi-worker runtime of Octane. It maximizes multi-core CPU utilization
+ * on modern Linux kernels through several architectural techniques:
+ *
+ * Architectural Features:
+ * - **SO_REUSEPORT Multi-Socket Sharding:** Each worker thread creates its own listening socket file
+ *   descriptor bound to the same port. The Linux kernel's BPF-driven socket hash distributes incoming
+ *   TCP SYN handshakes across workers with zero user-space lock contention.
+ * - **CPU Core Pinning (`pthread_setaffinity_np`):** When `options.pin_workers` is enabled, each worker
+ *   thread is pinned to a dedicated CPU core derived from `sched_getaffinity`. This guarantees that
+ *   network packet processing, user callbacks, and L1/L2 CPU caches remain localized on the core,
+ *   completely avoiding cross-NUMA bus traffic.
+ * - **Per-Thread IoUringContext:** Each worker runs an independent `IoUringContext` with its own `io_uring`
+ *   ring and dedicated `ExecutionQueue` thread pools.
+ * - **Clean Signal Lifecycle Management:** Uses `pthread_sigmask` to block `SIGINT` and `SIGTERM` in
+ *   worker threads and dedicates a monitor thread (`sigtimedwait`) to perform clean shutdown and socket drainage.
+ *
+ * Where this is imported / used:
+ * - Direct Include: `#include "transport/TcpServer.h"`
+ * - Application Core: Instantiated inside `octane::init::listen` (`include/Octane.h`) to boot the web application.
+ *
+ * @author Octane Framework Team / FitOps Backend Core
+ * @date 2026
+ */
+
 #pragma once
 
 #include "HttpLimits.h"
@@ -8,7 +37,7 @@
 #include <atomic>
 #include <cerrno>
 #include <cstring>
-#include <iostream>
+#include <print>
 #include <exception>
 #include <memory>
 #include <mutex>
@@ -27,12 +56,27 @@
 
 namespace octane::transport {
 
+/**
+ * @struct TcpServerOptions
+ * @brief Runtime options configuring Linux kernel io_uring, worker pinning, and execution pools.
+ */
 struct TcpServerOptions {
+    /// Depth of the io_uring submission and completion queues per worker (default: 256)
     unsigned int ring_queue_depth{256};
+
+    /// When true, binds each worker thread to a dedicated physical CPU core (default: true)
     bool pin_workers{true};
+
+    /// IPv4 network interface address to bind (default: "0.0.0.0")
     std::string bind_address{"0.0.0.0"};
+
+    /// Offloaded worker thread pool options for blocking I/O and background jobs
     ExecutionQueueOptions execution_queues{};
 
+    /**
+     * @brief Validates options settings and bounds.
+     * @throws std::invalid_argument If queue depth is < 8, IP address is invalid, or queues are misconfigured.
+     */
     void validate() const {
         if (ring_queue_depth < 8)
             throw std::invalid_argument("io_uring queue depth must be at least 8");
@@ -52,8 +96,18 @@ struct TcpServerOptions {
     }
 };
 
+/**
+ * @class TcpServer
+ * @brief Multi-worker HTTP server managing listening sockets, CPU affinity, and worker loops.
+ */
 class TcpServer {
 public:
+    /**
+     * @brief Constructs a TcpServer with a shared Router.
+     * @param router Shared pointer to application route table.
+     * @param limits Protocol limits and boundaries.
+     * @param options Tuning and queue options.
+     */
     TcpServer(std::shared_ptr<octane::Router> router, const HttpLimits& limits,
               const TcpServerOptions& options = {})
         : router_(std::move(router)), limits_(limits), options_(options) {
@@ -61,6 +115,12 @@ public:
         options_.validate();
     }
 
+    /**
+     * @brief Constructs a TcpServer referencing an existing Router.
+     * @param router Reference to application route table.
+     * @param limits Protocol limits and boundaries.
+     * @param options Tuning and queue options.
+     */
     TcpServer(octane::Router& router, const HttpLimits& limits,
               const TcpServerOptions& options = {})
         : router_(std::shared_ptr<octane::Router>(&router, [](octane::Router*) {})),
@@ -69,10 +129,21 @@ public:
         options_.validate();
     }
 
+    /**
+     * @brief Requests graceful termination of all server worker loops.
+     */
     void stop() noexcept {
         stop_requested_->store(true, std::memory_order_release);
     }
 
+    /**
+     * @brief Starts the server listening on the specified port across worker threads.
+     * @details Blocks the calling thread until SIGINT / SIGTERM is received or stop() is invoked.
+     * @param port TCP port to bind (e.g. 8080). If 0, an ephemeral OS port is selected.
+     * @param num_threads Number of worker threads / io_uring rings to spawn.
+     * @throws std::invalid_argument If port or thread count is invalid.
+     * @throws std::runtime_error If socket creation, bind, or CPU pinning fails.
+     */
     void listen(int port, size_t num_threads) {
         if (port < 0 || port > 65535 || num_threads == 0)
             throw std::invalid_argument("Invalid listen configuration");
@@ -118,13 +189,12 @@ public:
             }
 
             if (::isatty(STDOUT_FILENO)) {
-                std::cout << "\033[1;32m● Octane (io_uring) listening on port "
-                          << port_ << "\033[0m" << std::endl;
+                std::println("\033[1;32m● Octane (io_uring) listening on port {}\033[0m", port_);
             } else {
                 // Keep redirected logs machine-readable and free of ANSI bytes.
-                std::cout << "Octane (io_uring) listening on port "
-                          << port_ << std::endl;
+                std::println("Octane (io_uring) listening on port {}", port_);
             }
+            std::fflush(stdout);
             const std::vector<int> worker_cpus =
                 options_.pin_workers ? available_cpus() : std::vector<int>{};
             workers_.reserve(num_threads_);
@@ -157,20 +227,23 @@ public:
     }
 
 private:
-    int port_{0};
-    size_t num_threads_{1};
-    std::shared_ptr<octane::Router> router_;
-    HttpLimits limits_;
-    TcpServerOptions options_;
-    std::vector<std::thread> workers_;
+    int port_{0};                                      ///< Bound TCP port number
+    size_t num_threads_{1};                           ///< Active worker thread count
+    std::shared_ptr<octane::Router> router_;          ///< Application route table
+    HttpLimits limits_;                               ///< Protocol boundary constraints
+    TcpServerOptions options_;                        ///< Server configuration options
+    std::vector<std::thread> workers_;                 ///< Active worker threads
     std::shared_ptr<std::atomic_size_t> active_connections_ =
-        std::make_shared<std::atomic_size_t>(0);
+        std::make_shared<std::atomic_size_t>(0);      ///< Concurrent connection counter
     std::shared_ptr<std::atomic_bool> stop_requested_ =
-        std::make_shared<std::atomic_bool>(false);
-    inline static std::atomic_bool signal_owner_{false};
-    std::mutex worker_error_mutex_;
-    std::exception_ptr worker_error_;
+        std::make_shared<std::atomic_bool>(false);    ///< Shutdown notification flag
+    inline static std::atomic_bool signal_owner_{false}; ///< Single server signal lock
+    std::mutex worker_error_mutex_;                   ///< Protects worker_error_
+    std::exception_ptr worker_error_;                 ///< Captures worker thread exceptions
 
+    /**
+     * @brief Dedicated thread waiting synchronously for SIGINT or SIGTERM via sigtimedwait.
+     */
     static void wait_for_shutdown_signal(
         const std::shared_ptr<std::atomic_bool>& stop,
         sigset_t shutdown_signals) noexcept {
@@ -189,11 +262,17 @@ private:
         }
     }
 
+    /**
+     * @brief Restores process signal mask to pre-listen state.
+     */
     static void restore_signal_mask(const sigset_t& previous_mask) noexcept {
         pthread_sigmask(SIG_SETMASK, &previous_mask, nullptr);
         signal_owner_.store(false, std::memory_order_release);
     }
 
+    /**
+     * @brief Queries OS assigned port for an open socket file descriptor.
+     */
     static int socket_port(int fd) {
         sockaddr_in address{};
         socklen_t length = sizeof(address);
@@ -203,6 +282,9 @@ private:
         return ntohs(address.sin_port);
     }
 
+    /**
+     * @brief Creates a non-blocking TCP socket configured with SO_REUSEADDR and SO_REUSEPORT.
+     */
     static int create_listening_socket(int port, const std::string& bind_address) {
         int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
         if (fd < 0)
@@ -240,6 +322,9 @@ private:
         return fd;
     }
 
+    /**
+     * @brief Discovers CPU cores permitted for this process via sched_getaffinity.
+     */
     static std::vector<int> available_cpus() {
         cpu_set_t allowed;
         CPU_ZERO(&allowed);
@@ -256,6 +341,9 @@ private:
         return cpus;
     }
 
+    /**
+     * @brief Pins the calling worker thread to a specific CPU core ID.
+     */
     static void pin_current_worker(int cpu) {
         if (cpu < 0) return;
         cpu_set_t affinity;
@@ -268,6 +356,9 @@ private:
                                      std::string(std::strerror(result)));
     }
 
+    /**
+     * @brief Worker thread entry function initializing affinity, IoUringContext, and event loop.
+     */
     void run_worker(int server_fd, int cpu) noexcept {
         try {
             pin_current_worker(cpu);
@@ -277,7 +368,7 @@ private:
                                         options_.execution_queues);
             ring_context.run();
         } catch (const std::exception& error) {
-            std::cerr << "io_uring worker stopped: " << error.what() << '\n';
+            std::println(stderr, "io_uring worker stopped: {}", error.what());
             {
                 std::lock_guard lock(worker_error_mutex_);
                 if (!worker_error_) worker_error_ = std::current_exception();

@@ -247,6 +247,8 @@ bool is_valid_phone(std::string_view value, std::size_t max_bytes) noexcept {
     return digits >= 5 && digits <= 15;
 }
 
+// Validates that filenames cannot cause path traversal or inject invalid UTF-8.
+// Rejects relative segments (..), path separators (/ and \), colons, and control characters.
 bool is_safe_filename(std::string_view value, std::size_t max_bytes) noexcept {
     if (value.empty() || value.size() > max_bytes || value == "." || value == ".." ||
         !is_valid_utf8(value)) {
@@ -256,6 +258,145 @@ bool is_safe_filename(std::string_view value, std::size_t max_bytes) noexcept {
         if (c < 0x20 || c == 0x7f || c == '/' || c == '\\' || c == ':') return false;
     }
     return value.find("..") == std::string_view::npos;
+}
+
+// Validates 24-hour time of day in either "HH:MM" (5 bytes) or "HH:MM:SS" (8 bytes).
+// Used for gym working hours (GymWorkingHours) and booking slot times (GymScheduleSlot).
+bool is_valid_time_of_day(std::string_view value) noexcept {
+    if (value.size() != 5 && value.size() != 8) return false;
+    if (value[2] != ':') return false;
+    if (!ascii_digit(static_cast<unsigned char>(value[0])) ||
+        !ascii_digit(static_cast<unsigned char>(value[1])) ||
+        !ascii_digit(static_cast<unsigned char>(value[3])) ||
+        !ascii_digit(static_cast<unsigned char>(value[4]))) {
+        return false;
+    }
+    const unsigned hour = (value[0] - '0') * 10 + (value[1] - '0');
+    const unsigned minute = (value[3] - '0') * 10 + (value[4] - '0');
+    if (hour > 23 || minute > 59) return false;
+
+    if (value.size() == 8) {
+        if (value[5] != ':') return false;
+        if (!ascii_digit(static_cast<unsigned char>(value[6])) ||
+            !ascii_digit(static_cast<unsigned char>(value[7]))) {
+            return false;
+        }
+        const unsigned second = (value[6] - '0') * 10 + (value[7] - '0');
+        if (second > 59) return false;
+    }
+    return true;
+}
+
+// Validates ISO 8601 UTC timestamps (D-044).
+// Accepts "YYYY-MM-DDTHH:MM:SSZ", with optional subseconds ".fff" and timezone offsets ("+02:00").
+// Date portion is strictly checked against real calendar bounds including leap years.
+bool is_valid_iso_timestamp(std::string_view value) noexcept {
+    if (value.size() < 20 || !is_valid_iso_date(value.substr(0, 10))) return false;
+    if (value[10] != 'T' && value[10] != 't') return false;
+    if (value[13] != ':' || value[16] != ':') return false;
+    for (std::size_t i : {11, 12, 14, 15, 17, 18}) {
+        if (!ascii_digit(static_cast<unsigned char>(value[i]))) return false;
+    }
+    const unsigned hour = (value[11] - '0') * 10 + (value[12] - '0');
+    const unsigned minute = (value[14] - '0') * 10 + (value[15] - '0');
+    const unsigned second = (value[17] - '0') * 10 + (value[18] - '0');
+    if (hour > 23 || minute > 59 || second > 59) return false;
+
+    std::size_t idx = 19;
+    // Optional fraction (.fff)
+    if (idx < value.size() && value[idx] == '.') {
+        ++idx;
+        const std::size_t frac_start = idx;
+        while (idx < value.size() && ascii_digit(static_cast<unsigned char>(value[idx]))) {
+            ++idx;
+        }
+        if (idx == frac_start) return false;
+    }
+
+    if (idx >= value.size()) return false;
+
+    // UTC "Z" or timezone offset "[+-]HH:MM"
+    if (value[idx] == 'Z' || value[idx] == 'z') {
+        return idx + 1 == value.size();
+    }
+    if (value[idx] == '+' || value[idx] == '-') {
+        if (idx + 6 != value.size() || value[idx + 3] != ':') return false;
+        for (std::size_t i : {idx + 1, idx + 2, idx + 4, idx + 5}) {
+            if (!ascii_digit(static_cast<unsigned char>(value[i]))) return false;
+        }
+        const unsigned tz_hour = (value[idx + 1] - '0') * 10 + (value[idx + 2] - '0');
+        const unsigned tz_min = (value[idx + 4] - '0') * 10 + (value[idx + 5] - '0');
+        return tz_hour <= 23 && tz_min <= 59;
+    }
+    return false;
+}
+
+// Validates Italian Codice Fiscale (16 characters: 6 alpha, 2 digits, 1 alpha, 2 digits, 1 alpha, 3 alnum, 1 alpha).
+// Used for customer profiles, gym memberships, and FattureInCloud synchronization.
+bool is_valid_codice_fiscale(std::string_view value) noexcept {
+    if (value.size() != 16) return false;
+    for (std::size_t i = 0; i < 6; ++i) {
+        if (!ascii_alpha(static_cast<unsigned char>(value[i]))) return false;
+    }
+    if (!ascii_digit(static_cast<unsigned char>(value[6])) ||
+        !ascii_digit(static_cast<unsigned char>(value[7]))) {
+        return false;
+    }
+    if (!ascii_alpha(static_cast<unsigned char>(value[8]))) return false;
+    if (!ascii_digit(static_cast<unsigned char>(value[9])) ||
+        !ascii_digit(static_cast<unsigned char>(value[10]))) {
+        return false;
+    }
+    if (!ascii_alpha(static_cast<unsigned char>(value[11]))) return false;
+    for (std::size_t i = 12; i < 15; ++i) {
+        if (!ascii_alnum(static_cast<unsigned char>(value[i]))) return false;
+    }
+    return ascii_alpha(static_cast<unsigned char>(value[15]));
+}
+
+// Validates Italian Partita IVA (11 numeric digits).
+// Used for gym corporate settings (GymCompanyInfo) and invoice billing data.
+bool is_valid_partita_iva(std::string_view value) noexcept {
+    if (value.size() != 11) return false;
+    for (const unsigned char c : value) {
+        if (!ascii_digit(c)) return false;
+    }
+    return true;
+}
+
+// Sanity checks uploaded medical certificate PDF buffers for header integrity and active exploits (D-020, D-063).
+// Rejects any file missing the "%PDF-" magic bytes or containing active execution dictionary tokens.
+bool is_safe_pdf_header_and_content(std::string_view bytes, std::size_t max_bytes) noexcept {
+    if (bytes.size() < 5 || bytes.size() > max_bytes) return false;
+    if (bytes.substr(0, 5) != "%PDF-") return false;
+
+    // Scan for dangerous executable or active PDF action tokens
+    static constexpr std::string_view dangerous_tokens[] = {
+        "/JavaScript",
+        "/JS",
+        "/Launch",
+        "/EmbeddedFiles",
+        "/RichMedia"
+    };
+
+    for (const auto token : dangerous_tokens) {
+        if (bytes.find(token) != std::string_view::npos) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Prevents CSV / Spreadsheet Formula Injection (CWE-1236, D-028).
+// Prohibits strings starting with '=', '+', '-', '@', '\t', or '\r' from executing formulas in Excel/LibreOffice.
+bool is_safe_spreadsheet_text(std::string_view value) noexcept {
+    if (value.empty()) return true;
+    const unsigned char first = static_cast<unsigned char>(value.front());
+    if (first == '=' || first == '+' || first == '-' || first == '@' ||
+        first == '\t' || first == '\r') {
+        return false;
+    }
+    return value.find('\0') == std::string_view::npos;
 }
 
 std::optional<std::int64_t> parse_int64(std::string_view value) noexcept {

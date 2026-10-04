@@ -11,7 +11,7 @@
  *   DELETE /users/:id      — delete a user
  */
 
-#include "App.h"
+#include "Octane.h"
 #include "RouteBase.h"
 #include <string>
 #include <unordered_map>
@@ -192,7 +192,7 @@ public:
 };
 
 int main() {
-    App app;
+    octane::init app;
 
     // Explicit Inline policy. Omitting the policy has the same behavior.
     app.get<Health>("/health", HandlerExecution::inline_execution());
@@ -209,18 +209,20 @@ int main() {
     app.del<DeleteUser>("/users/:id", database);
 
     transport::TcpServerOptions transport_options;
-    transport_options.execution_queues.shared_threads_per_shard = 1;
-    transport_options.execution_queues.shared_capacity = 128;
+    transport_options.pin_workers = true;
+    transport_options.ring_queue_depth = 512;
+    transport_options.execution_queues.shared_threads_per_shard = 2;
+    transport_options.execution_queues.shared_capacity = 256;
     transport_options.execution_queues.named.push_back({
         "database",
-        1,   // Worker threads created per io_uring shard when first used.
-        256  // Maximum waiting jobs per shard.
+        2,   // Worker threads created per io_uring shard when first used.
+        512  // Maximum waiting jobs per shard.
     });
 
     HttpLimits limits;
-    // Keep the tutorial's ring and auxiliary queue thread count modest.
+    // Scale ring workers to the host CPU cores (up to 8 for dedicated P-cores)
     const int ring_workers = static_cast<int>(
-        std::min(4u, std::max(1u, std::thread::hardware_concurrency())));
+        std::min(8u, std::max(1u, std::thread::hardware_concurrency())));
     app.listen(8080, ring_workers, limits, transport_options);
 }
 

@@ -1,8 +1,9 @@
 cmake_minimum_required(VERSION 3.20)
 project(octane VERSION 0.2.0 LANGUAGES CXX)
 
-set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 # ── Backend Selection ─────────────────────────
 option(OCTANE_USE_IO_URING "Use native io_uring backend instead of Asio" ON)
@@ -46,6 +47,23 @@ endif()
 option(OCTANE_DEV_MODE "Enable live reload" OFF)
 if(OCTANE_DEV_MODE)
     target_compile_definitions(octane_lib PUBLIC OCTANE_DEV_MODE)
+endif()
+
+# ── compiler optimizations ───────────────────
+option(OCTANE_NATIVE_ARCH "Enable -march=native -mtune=native for peak host performance" ON)
+option(OCTANE_ENABLE_LTO "Enable Interprocedural / Link-Time Optimization (LTO)" ON)
+
+if(CMAKE_BUILD_TYPE STREQUAL "Release" OR NOT CMAKE_BUILD_TYPE)
+    if(OCTANE_NATIVE_ARCH AND (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang"))
+        target_compile_options(octane_lib PUBLIC -march=native -mtune=native)
+    endif()
+    if(OCTANE_ENABLE_LTO)
+        include(CheckIPOSupported)
+        check_ipo_supported(RESULT ipo_supported OUTPUT ipo_error)
+        if(ipo_supported)
+            set(CMAKE_INTERPROCEDURAL_OPTIMIZATION ON)
+        endif()
+    endif()
 endif()
 
 # ── examples ──────────────────────────────────

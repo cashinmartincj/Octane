@@ -268,7 +268,7 @@ No multi-hour soak test or full HTTP conformance audit was performed for this re
 ## Quick Start Guide
 
 ```cpp
-#include "App.h"
+#include "Octane.h"
 #include "RouteBase.h"
 
 class HelloWorld : public octane::routes::Get<HelloWorld> {
@@ -279,7 +279,7 @@ public:
 };
 
 int main() {
-    octane::App app;
+    octane::init app;
     app.get<HelloWorld>("/");
     app.listen(8080);
 }
@@ -288,7 +288,7 @@ int main() {
 Or with `using namespace octane` to avoid prefixing:
 
 ```cpp
-#include "App.h"
+#include "Octane.h"
 #include "RouteBase.h"
 
 using namespace octane;
@@ -301,7 +301,7 @@ public:
 };
 
 int main() {
-    App app;
+    octane::init app;
     app.get<HelloWorld>("/");
     app.listen(8080);
 }
@@ -398,7 +398,7 @@ supported handler styles.
 ```text
 octane/
 ├── include/
-│   ├── App.h           # Application and route-registration facade
+│   ├── Octane.h        # Application initialization and route-registration facade
 │   ├── Router.h        # Hybrid static/dynamic router
 │   ├── Trie.h          # Trie for dynamic route matching
 │   ├── HttpParser.h    # Raw bytes → HttpRequest

@@ -108,7 +108,7 @@ cmake --build build -j"$(nproc)"
 ## 4. Minimal application
 
 ```cpp
-#include "App.h"
+#include "Octane.h"
 #include "RouteBase.h"
 
 class Hello : public octane::routes::Get<Hello> {
@@ -119,13 +119,13 @@ public:
 };
 
 int main() {
-    octane::App app;
+    octane::init app;
     app.get<Hello>("/");
     app.listen(8080);
 }
 ```
 
-`App::listen` blocks the calling thread until `SIGINT`, `SIGTERM`, a call to
+`octane::init::listen` blocks the calling thread until `SIGINT`, `SIGTERM`, a call to
 the underlying server's stop mechanism, or a worker failure ends the server.
 Only one signal-managed server can listen in a process.
 
@@ -173,7 +173,7 @@ The supplied CRTP bases are:
 | PATCH | `octane::routes::Patch<T>` | `app.patch<T>(path)` |
 | DELETE | `octane::routes::Del<T>` | `app.del<T>(path)` |
 
-`App` and `Router` also expose `head` and `options` registration. Use a plain
+`octane::init` and `Router` also expose `head` and `options` registration. Use a plain
 handler for those methods because dedicated `routes::Head<T>` and
 `routes::Options<T>` convenience bases are not currently provided.
 
@@ -409,7 +409,42 @@ Content-Length. In particular:
 Put Octane behind a trusted production edge and confirm that request bodies
 reach it with Content-Length. See [`deployment.md`](deployment.md).
 
-## 12. Test and benchmark
+## 12. Input validation utilities
+
+Octane provides zero-allocation sanity-check and input-validation utilities in
+`utils/InputValidation.h`. These operate directly on non-owning `std::string_view`
+slices over incoming request buffers with no heap allocation:
+
+```cpp
+#include "utils/InputValidation.h"
+
+using namespace octane::validation;
+
+// Email & identity
+if (!is_valid_email(req.query("email"))) { ... }
+if (!is_valid_username(req.query("username"))) { ... }
+if (!is_valid_slug(req.param("gym_slug"))) { ... }
+
+// Date, Time, and Timestamps
+if (!is_valid_iso_date(req.query("date"))) { ... }           // "YYYY-MM-DD"
+if (!is_valid_time_of_day(req.query("time"))) { ... }        // "08:30" or "18:00:00"
+if (!is_valid_iso_timestamp(req.query("start"))) { ... }     // "2026-09-29T06:30:00Z"
+
+// Regional & Corporate
+if (!is_valid_codice_fiscale(req.query("cf"))) { ... }       // Italian Tax Code (16 chars)
+if (!is_valid_partita_iva(req.query("vat"))) { ... }         // Italian VAT (11 digits)
+
+// Security & upload checks
+if (!is_safe_filename(req.header("X-Filename"))) { ... }     // Traversal & control character defense
+if (!is_safe_pdf_header_and_content(file_bytes)) { ... }      // PDF magic bytes & active exploit filter
+if (!is_safe_spreadsheet_text(cell_text)) { ... }            // Formula injection defense (=, +, -, @)
+```
+
+> **Note:** These functions validate input invariants. They do not escape or
+> sanitize SQL strings. All database queries must still use parameterized queries
+> with positional bind parameters ($1, $2) via libpqxx.
+
+## 13. Test and benchmark
 
 Run the full regression suite:
 
@@ -446,7 +481,7 @@ hardware, builds, payloads, concurrency, and client placement. A loopback
 benchmark is useful for regression detection but is not a production capacity
 claim.
 
-## 13. Common mistakes
+## 14. Common mistakes
 
 - Calling `res.body(...)`: `body` is storage, not a builder; use `text`,
   `html`, `json`, or `send`.

@@ -1,3 +1,34 @@
+/**
+ * @file IoUringContext.h
+ * @brief High-throughput Linux io_uring kernel event reactor for HTTP/1.1 transport.
+ *
+ * @details
+ * `IoUringContext` represents the ultra-performance asynchronous core of the Octane framework.
+ * It manages an independent Linux `io_uring` ring instance per worker thread, interacting directly
+ * with the Linux kernel submission and completion queues without system call overhead on hot paths.
+ *
+ * Core Architectural Highlights:
+ * - **Zero-Syscall Multi-Shot Accept:** Utilizes `io_uring_prep_multishot_accept` where supported to
+ *   accept multiple incoming client TCP sockets continuously with a single submission queue entry (SQE).
+ * - **Allocation-Free Context Block Pool (`ContextPool`):** Preallocates slabs of 256 `AsyncContext`
+ *   descriptors, completely eliminating heap allocations when scheduling operations.
+ * - **Zero-Allocation Binary Min-Heap Deadlines:** Maintains an indexed priority queue (`deadlines_`)
+ *   for active connection timeouts (read, write, idle keep-alive). Nodes update in O(log N) in-place
+ *   without timerfd allocations or dynamic memory allocations.
+ * - **Zero-Copy Vectored I/O (`iovec`):** Assembles response headers and response body buffers directly
+ *   into scatter-gather I/O vectors for transmission via `io_uring_prep_sendmsg`.
+ * - **Inter-Thread Handler Wakeup:** Integrates a non-blocking Linux `eventfd` (`wake_fd_`) monitored via
+ *   `POLLIN` in the ring to wake the reactor loop when background queue workers complete offloaded requests.
+ *
+ * Where this is imported / used:
+ * - Direct Include: `#include "transport/IoUringContext.h"`
+ * - Worker Engine: Instantiated inside `octane::transport::TcpServer::run_worker` (`include/transport/TcpServer.h`),
+ *   running one isolated `IoUringContext` per CPU core.
+ *
+ * @author Octane Framework Team / FitOps Backend Core
+ * @date 2026
+ */
+
 #pragma once
 
 #include <liburing.h>
@@ -34,55 +65,84 @@
 
 namespace octane::transport {
 
-enum class OperationType { Accept, AcceptRetry, Read, Write, Wake, Cancel };
+/**
+ * @enum OperationType
+ * @brief Identifies the asynchronous operation currently tracked by an SQE context.
+ */
+enum class OperationType {
+    Accept,       ///< Listening socket accept
+    AcceptRetry,  ///< Single-shot accept fallback
+    Read,         ///< Socket receive operation
+    Write,        ///< Socket send / writev operation
+    Wake,         ///< Worker thread completion eventfd poll
+    Cancel        ///< SQE cancellation request
+};
+
 struct AsyncContext;
 
+/**
+ * @struct ConnectionState
+ * @brief Represents the complete lifecycle state of an active TCP client connection.
+ */
 struct ConnectionState {
-    int fd{-1};
-    std::string input;
-    std::size_t read_position{0};
-    std::array<char, 4096> read_buffer{};
+    int fd{-1};                              ///< Active client socket file descriptor
+    std::string input;                      ///< Dynamic buffer for accumulated HTTP request bytes
+    std::size_t read_position{0};           ///< Offset of unparsed bytes in `input`
+    std::array<char, 4096> read_buffer{};   ///< Static 4KB scratch buffer for kernel recv
 
-    std::string response_headers;
-    std::string owned_body;
-    std::string_view response_body;
-    std::array<iovec, 2> write_iov{};
-    msghdr write_message{};
-    std::size_t write_offset{0};
-    std::size_t write_size{0};
-    std::size_t request_count{0};
-    std::uint64_t id{0};
+    std::string response_headers;           ///< Serialized HTTP/1.1 response headers
+    std::string owned_body;                 ///< Transferred dynamic body payload
+    std::string_view response_body;         ///< Active response body view (owned or mmap)
+    std::array<iovec, 2> write_iov{};       ///< Scatter-gather vector: [0]=headers, [1]=body
+    msghdr write_message{};                 ///< Linux message header for `sendmsg`
+    std::size_t write_offset{0};            ///< Bytes transmitted so far
+    std::size_t write_size{0};              ///< Total bytes to transmit
+    std::size_t request_count{0};           ///< Total HTTP requests served on this keep-alive connection
+    std::uint64_t id{0};                    ///< Unique per-connection identifier
     static constexpr std::size_t no_deadline =
         std::numeric_limits<std::size_t>::max();
-    std::size_t deadline_index{no_deadline};
-    OperationType deadline_operation{OperationType::Read};
-    std::chrono::steady_clock::time_point deadline;
+    std::size_t deadline_index{no_deadline};///< Slot in binary min-heap `deadlines_`
+    OperationType deadline_operation{OperationType::Read}; ///< Operation associated with current deadline
+    std::chrono::steady_clock::time_point deadline;        ///< Expiration time point
 
-    bool close_after_write{false};
-    bool closed{false};
-    bool cancel_requested{false};
-    bool handler_pending{false};
-    AsyncContext* pending{nullptr};
-    std::chrono::steady_clock::time_point read_deadline;
-    std::chrono::steady_clock::time_point write_deadline;
+    bool close_after_write{false};          ///< Close connection once write buffer drains
+    bool closed{false};                     ///< True if socket has been closed
+    bool cancel_requested{false};           ///< True if cancellation SQE has been issued
+    bool handler_pending{false};            ///< True if offloaded to background ExecutionQueue
+    AsyncContext* pending{nullptr};         ///< Pointer to current in-flight SQE context
+    std::chrono::steady_clock::time_point read_deadline;  ///< Read timeout limit
+    std::chrono::steady_clock::time_point write_deadline; ///< Write timeout limit
 
+    /// Returns unconsumed input bytes available for parsing
     [[nodiscard]] std::size_t available_input() const noexcept {
         return input.size() - read_position;
     }
 
+    /// Returns non-owning string view of unconsumed input bytes
     [[nodiscard]] std::string_view input_view() const noexcept {
         return std::string_view(input).substr(read_position);
     }
 };
 
+/**
+ * @struct AsyncContext
+ * @brief User data descriptor attached to each io_uring SQE (`sqe->user_data`).
+ */
 struct AsyncContext {
-    OperationType operation{OperationType::Cancel};
-    ConnectionState* connection{nullptr};
-    __kernel_timespec timeout{};
+    OperationType operation{OperationType::Cancel}; ///< Type of active operation
+    ConnectionState* connection{nullptr};            ///< Associated connection state (or null)
+    __kernel_timespec timeout{};                     ///< Kernel timeout specification
 };
 
+/**
+ * @class ContextPool
+ * @brief Slab-allocated pool for AsyncContext objects ensuring zero heap allocations on hot path.
+ */
 class ContextPool {
 public:
+    /**
+     * @brief Acquires an AsyncContext initialized with operation and connection pointers.
+     */
     AsyncContext* acquire(OperationType operation,
                           ConnectionState* connection = nullptr) {
         if (free_.empty()) grow();
@@ -94,6 +154,9 @@ public:
         return context;
     }
 
+    /**
+     * @brief Returns an AsyncContext to the free list for immediate reuse.
+     */
     void release(AsyncContext* context) noexcept {
         context->connection = nullptr;
         free_.push_back(context);
@@ -113,8 +176,22 @@ private:
     }
 };
 
+/**
+ * @class IoUringContext
+ * @brief Single-threaded Linux io_uring reactor driving socket I/O, parsing, and execution.
+ */
 class IoUringContext {
 public:
+    /**
+     * @brief Initializes an io_uring ring and eventfd wakeup notification channel.
+     * @param server_fd Pre-configured listening socket file descriptor.
+     * @param router Shared pointer to application route table.
+     * @param limits Protocol and timeout boundaries.
+     * @param global_connections Shared atomic tracking global concurrent connections.
+     * @param external_stop Shared atomic flag signaling graceful server shutdown.
+     * @param queue_depth Number of SQE/CQE entries in ring (default: 128).
+     * @param execution_options Offload thread pool queue configurations.
+     */
     explicit IoUringContext(
         int server_fd,
         std::shared_ptr<octane::Router> router,
@@ -142,6 +219,9 @@ public:
         }
     }
 
+    /**
+     * @brief Destructor tearing down active connections, eventfd, and the io_uring ring.
+     */
     ~IoUringContext() {
         executors_.clear();
         for (auto& [fd, connection] : connections_) {
@@ -154,6 +234,9 @@ public:
     IoUringContext(const IoUringContext&) = delete;
     IoUringContext& operator=(const IoUringContext&) = delete;
 
+    /**
+     * @brief Main reactor event loop processing ring CQEs and scheduling requests.
+     */
     void run() {
         if (!queue_accept()) throw std::runtime_error("Failed to queue accept");
         if (!queue_wake_poll())

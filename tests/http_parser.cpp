@@ -37,6 +37,10 @@ int main() {
     check(!req.keep_alive);
     req = octane::HttpParser::parse_headers("GET /?q=a%20b HTTP/1.1\r\nHost: x\r\n\r\n");
     check(req.q("q") == "a b");
+    req = octane::HttpParser::parse_headers("GET /?trainer=a%40example.test&trainer=b%40example.test&mode=a%40example.test%7Cflat HTTP/1.1\r\nHost: x\r\n\r\n");
+    check(req.q("trainer") == "b@example.test");
+    check(req.qlist("trainer") == std::vector<std::string>({"a@example.test", "b@example.test"}));
+    check(req.qlist("mode") == std::vector<std::string>({"a@example.test|flat"}));
     octane::Router router;
     router.get("/", [](auto&, auto&) { throw std::runtime_error("private detail"); });
     octane::core::RequestDispatcher dispatcher(router);

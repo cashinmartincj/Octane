@@ -49,6 +49,37 @@ int main() {
     check(is_safe_filename("medical-certificate.pdf"));
     check(!is_safe_filename("../certificate.pdf"));
 
+    check(is_valid_time_of_day("08:30"));
+    check(is_valid_time_of_day("18:00:00"));
+    check(!is_valid_time_of_day("24:00"));
+    check(!is_valid_time_of_day("08:60"));
+    check(!is_valid_time_of_day("8:30"));
+
+    check(is_valid_iso_timestamp("2026-09-29T06:30:00Z"));
+    check(is_valid_iso_timestamp("2026-09-29T06:30:00.123Z"));
+    check(is_valid_iso_timestamp("2026-09-29T08:30:00+02:00"));
+    check(!is_valid_iso_timestamp("2026-09-29 06:30:00"));
+    check(!is_valid_iso_timestamp("2026-09-29T25:00:00Z"));
+
+    check(is_valid_codice_fiscale("RSSMRA85M01H501Z"));
+    check(!is_valid_codice_fiscale("RSSMRA85M01H501"));
+    check(!is_valid_codice_fiscale("1234567890123456"));
+
+    check(is_valid_partita_iva("04789290402"));
+    check(!is_valid_partita_iva("0478929040"));
+    check(!is_valid_partita_iva("0478929040A"));
+
+    check(is_safe_pdf_header_and_content("%PDF-1.7\nnormal pdf content"));
+    check(!is_safe_pdf_header_and_content("GIF89a"));
+    check(!is_safe_pdf_header_and_content("%PDF-1.7\n/JavaScript (alert(1))"));
+    check(!is_safe_pdf_header_and_content("%PDF-1.7\n/Launch (malware.exe)"));
+
+    check(is_safe_spreadsheet_text("Regular workout note"));
+    check(!is_safe_spreadsheet_text("=CMD('calc')"));
+    check(!is_safe_spreadsheet_text("+12345"));
+    check(!is_safe_spreadsheet_text("-500"));
+    check(!is_safe_spreadsheet_text("@malicious"));
+
     check(parse_int64("-9223372036854775808") == std::numeric_limits<std::int64_t>::min());
     check(!parse_int64("12x"));
     check(parse_uint64("18446744073709551615") == std::numeric_limits<std::uint64_t>::max());

@@ -1,6 +1,33 @@
 /**
  * @file HttpParser.h
- * @brief Parses bounded HTTP requests with zero heap allocations in the hot path.
+ * @brief Zero-copy, bounded HTTP/1.1 request parser.
+ *
+ * @details
+ * `HttpParser` provides high-throughput, allocation-minimized parsing for HTTP/1.1 requests.
+ * It parses the request line (method, target URI, HTTP version), headers (case-insensitive keys),
+ * URL-encoded query parameters, cookies, and body framing (Content-Length).
+ *
+ * Key Design Principles:
+ * - **Zero Allocations in Hot Path:** All string slices (path, header keys, header values, cookies)
+ *   are stored as `std::string_view` referencing the underlying connection read buffer directly.
+ * - **RFC 9112 Strict Compliance:**
+ *   - Verifies RFC 9110 valid token characters for HTTP methods and header names.
+ *   - Enforces valid ASCII/tab values without control characters.
+ *   - Validates RFC 9112 URI framing (rejects whitespace, `#` fragments, invalid `%` encodings).
+ *   - Enforces required `Host` header for HTTP/1.1 requests.
+ *   - Rejects conflicting or duplicate `Content-Length`, `Host`, or `Transfer-Encoding` headers (RFC 9112 §6.1).
+ *   - Rejects `Transfer-Encoding: chunked` with 501 Not Implemented (HTTP/1.1 pipeline optimization).
+ *   - Enforces configurable boundaries via `HttpLimits` (`max_header_bytes`, `max_body_bytes`).
+ *
+ * Where this is imported / used:
+ * - Direct Include: `#include "HttpParser.h"`
+ * - Transport Engine: Called in `octane::transport::TcpConnection::handle_read()` to parse inbound
+ *   socket buffers received from the Linux `io_uring` completion ring.
+ * - Test Suites: Used extensively in test files (`tests/test_parser.cpp`, `tests/http_limits.cpp`)
+ *   to verify protocol conformance and edge-case handling.
+ *
+ * @author Octane Framework Team / FitOps Backend Core
+ * @date 2026
  */
 
 #pragma once
@@ -13,17 +40,42 @@
 
 namespace octane
 {
+    /**
+     * @struct HttpParseError
+     * @brief Exception thrown when an inbound HTTP request violates protocol syntax or size limits.
+     */
     struct HttpParseError : std::runtime_error {
-        int status;
+        int status; ///< Suggested HTTP response status code (e.g., 400 Bad Request, 413, 431, 501, 505)
+
+        /**
+         * @brief Constructs an HttpParseError with a specific HTTP status code.
+         * @param code Numeric HTTP error status code.
+         */
         explicit HttpParseError(int code) : std::runtime_error("Invalid HTTP request"), status(code) {}
     };
 
+    /**
+     * @class HttpParser
+     * @brief Static utility class providing zero-copy HTTP/1.1 parsing methods.
+     */
     class HttpParser {
     public:
+        /**
+         * @brief Assigns the request payload body view to the parsed HttpRequest object.
+         * @param req Target HttpRequest to receive the body.
+         * @param body Non-owning string_view referencing the payload slice in the connection buffer.
+         */
         static void set_body(HttpRequest& req, std::string_view body) {
             req.body.assign(body);
         }
 
+        /**
+         * @brief Parses the HTTP request line and headers from a raw buffer slice up to `\r\n\r\n`.
+         * @param raw Sliced buffer containing headers ending with `\r\n\r\n`.
+         * @param limits Boundary configuration constraints (header size, body size).
+         * @return Populated HttpRequest struct with non-owning views pointing into `raw`.
+         * @throws HttpParseError If the request violates RFC syntax, size boundaries, or required headers.
+         */
         static HttpRequest parse_headers(std::string_view raw, const HttpLimits& limits = {}) {
             HttpRequest req;
 
@@ -94,6 +146,12 @@ namespace octane
             return req;
         }
 
+        /**
+         * @brief Parses a complete raw HTTP request (headers + body) in one pass.
+         * @param raw Full raw request string view including body bytes.
+         * @return Fully parsed HttpRequest instance.
+         * @throws HttpParseError If headers or body lengths fail validation.
+         */
         static HttpRequest parse(std::string_view raw) {
             auto header_end = raw.find("\r\n\r\n");
             if (header_end == std::string_view::npos) throw HttpParseError(400);
@@ -106,10 +164,21 @@ namespace octane
             return req;
         }
 
+        /**
+         * @brief Performs case-insensitive ASCII string comparison.
+         * @param a First string view.
+         * @param b Second string view.
+         * @return True if strings match case-insensitively.
+         */
         static bool iequals(std::string_view a, std::string_view b) noexcept {
             return CaseInsensitiveEqual{}(a, b);
         }
 
+        /**
+         * @brief Checks if a string view conforms to RFC 9110 token character requirements.
+         * @param text String view to inspect.
+         * @return True if non-empty and containing only valid token characters.
+         */
         static bool token(std::string_view text) noexcept {
             if (text.empty()) return false;
             for (unsigned char c : text) {
@@ -121,6 +190,12 @@ namespace octane
             return true;
         }
 
+        /**
+         * @brief Searches a comma-delimited header value for a case-insensitive token.
+         * @param values Comma-separated header string (e.g. "keep-alive, upgrade").
+         * @param expected Target token to locate (e.g. "keep-alive").
+         * @return True if token exists.
+         */
         static bool contains_token(std::string_view values, std::string_view expected) noexcept {
             while (!values.empty()) {
                 const auto comma = values.find(',');
@@ -132,7 +207,28 @@ namespace octane
             return false;
         }
 
+        /**
+         * @brief Maps standard HTTP method string representations to HttpMethod enum.
+         * @param m Method token string view (e.g., "GET", "POST").
+         * @return Corresponding HttpMethod variant, or HttpMethod::UNKNOWN.
+         */
+        static HttpMethod toMethod(std::string_view m) noexcept {
+            if (m == "GET")     return HttpMethod::GET;
+            if (m == "POST")    return HttpMethod::POST;
+            if (m == "PUT")     return HttpMethod::PUT;
+            if (m == "PATCH")   return HttpMethod::PATCH;
+            if (m == "DELETE")  return HttpMethod::DEL;
+            if (m == "OPTIONS") return HttpMethod::OPTIONS;
+            if (m == "HEAD")    return HttpMethod::HEAD;
+            return HttpMethod::UNKNOWN;
+        }
+
     private:
+        /**
+         * @brief Converts a hexadecimal ASCII character to its 4-bit integer equivalent.
+         * @param c ASCII character.
+         * @return Integer [0..15] or -1 if invalid.
+         */
         static int hex(unsigned char c) noexcept {
             if (c >= '0' && c <= '9') return c - '0';
             if (c >= 'a' && c <= 'f') return c - 'a' + 10;
@@ -140,6 +236,12 @@ namespace octane
             return -1;
         }
 
+        /**
+         * @brief Parses and validates the HTTP request line (`METHOD /path HTTP/1.1`).
+         * @param line Single request line string view without trailing CRLF.
+         * @param req Output HttpRequest struct.
+         * @throws HttpParseError If method, path, or HTTP version is malformed.
+         */
         static void parseRequestLine(std::string_view line, HttpRequest& req) {
             const auto s1 = line.find(' ');
             if (s1 == std::string_view::npos) throw HttpParseError(400);
@@ -170,12 +272,18 @@ namespace octane
             auto qpos = full_path.find('?');
             if (qpos != std::string_view::npos) {
                 req.path = full_path.substr(0, qpos);
-                parseQueryString(full_path.substr(qpos + 1), req.query);
+                parseQueryString(full_path.substr(qpos + 1), req);
             } else {
                 req.path = full_path;
             }
         }
 
+        /**
+         * @brief Parses a single HTTP header line (`Key: Value`) into the request header table.
+         * @param line Single header line without trailing CRLF.
+         * @param req Output HttpRequest struct.
+         * @throws HttpParseError If key or value contains forbidden characters or illegal duplicates.
+         */
         static void parseHeaderLine(std::string_view line, HttpRequest& req) {
             const auto colon = line.find(':');
             if (colon == std::string_view::npos) throw HttpParseError(400);
@@ -196,6 +304,12 @@ namespace octane
             }
         }
 
+        /**
+         * @brief Decodes a percent-encoded query parameter component (e.g., `%20` -> ` `).
+         * @param encoded Raw percent-encoded string view.
+         * @return Decoded std::string.
+         * @throws HttpParseError If an invalid `%` sequence is encountered.
+         */
         static std::string decodeQueryComponent(std::string_view encoded) {
             std::string decoded;
             decoded.reserve(encoded.size());
@@ -214,20 +328,32 @@ namespace octane
             return decoded;
         }
 
-        static void parseQueryString(std::string_view qs, OwnedStringMap& query) {
+        /**
+         * @brief Parses and decodes query parameters from a raw query string (`k1=v1&k2=v2`).
+         * @param qs Query string slice following `?`.
+         * @param query Destination OwnedStringMap.
+         */
+        static void parseQueryString(std::string_view qs, HttpRequest& request) {
             while (!qs.empty()) {
                 auto amp = qs.find('&');
                 std::string_view pair = (amp == std::string_view::npos) ? qs : qs.substr(0, amp);
                 auto eq = pair.find('=');
                 if (eq != std::string_view::npos) {
-                    query[decodeQueryComponent(pair.substr(0, eq))] =
-                        decodeQueryComponent(pair.substr(eq + 1));
+                    auto key=decodeQueryComponent(pair.substr(0,eq));
+                    auto value=decodeQueryComponent(pair.substr(eq+1));
+                    request.query_lists[key].push_back(value);
+                    request.query[std::move(key)]=std::move(value);
                 }
                 if (amp == std::string_view::npos) break;
                 qs.remove_prefix(amp + 1);
             }
         }
 
+        /**
+         * @brief Parses semicolon-separated cookie values into the cookies StringMap.
+         * @param raw Raw Cookie header value.
+         * @param cookies Destination StringMap.
+         */
         static void parseCookies(std::string_view raw, StringMap& cookies) {
             while (!raw.empty()) {
                 auto semi = raw.find(';');
@@ -241,23 +367,17 @@ namespace octane
             }
         }
 
+        /**
+         * @brief Trims leading and trailing spaces and horizontal tabs from a string view.
+         * @param s Input string view.
+         * @return Trimmed string view without memory allocation.
+         */
         static std::string_view trim(std::string_view s) noexcept {
             while (!s.empty() && (s.front() == ' ' || s.front() == '\t')) 
                 s.remove_prefix(1);
             while (!s.empty() && (s.back()  == ' ' || s.back()  == '\t')) 
                 s.remove_suffix(1);
             return s;
-        }
-        
-        static HttpMethod toMethod(std::string_view m) noexcept {
-            if (m == "GET")     return HttpMethod::GET;
-            if (m == "POST")    return HttpMethod::POST;
-            if (m == "PUT")     return HttpMethod::PUT;
-            if (m == "PATCH")   return HttpMethod::PATCH;
-            if (m == "DELETE")  return HttpMethod::DEL;
-            if (m == "OPTIONS") return HttpMethod::OPTIONS;
-            if (m == "HEAD")    return HttpMethod::HEAD;
-            return HttpMethod::UNKNOWN;
         }
     };
 }

@@ -1,8 +1,25 @@
+/**
+ * @file FileHandle.cpp
+ * @brief Implementation of cross-platform memory-mapped file reader and static utility functions.
+ *
+ * @details
+ * Implements POSIX `mmap`/`munmap` and Windows `CreateFileMappingA`/`MapViewOfFile` bindings
+ * for zero-copy file serving in Octane.
+ *
+ * @author Octane Framework Team / FitOps Backend Core
+ * @date 2026
+ */
+
 #include "../include/FileHandle.h"
 #include <fstream>
 
 namespace octane::utils
 {
+    /**
+     * @brief Reads an entire file into memory via standard binary ifstream.
+     * @param path Path to file on disk.
+     * @return File content string, or empty string on error.
+     */
     std::string read_file(const std::string& path) {
         std::ifstream file(path, std::ios::binary | std::ios::ate);
         if (!file.is_open()) return {};
@@ -17,6 +34,11 @@ namespace octane::utils
         return buffer;
     }
 
+    /**
+     * @brief Opens and maps a file into virtual memory space.
+     * @param path Target filesystem path.
+     * @return True if mapped successfully; false otherwise.
+     */
     bool MappedFile::open(const std::string& path) {
     #ifdef _WIN32
         file = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -62,11 +84,18 @@ namespace octane::utils
     #endif
     }
 
+    /**
+     * @brief Provides a non-owning string_view over the mapped file memory.
+     * @return Non-owning std::string_view slice.
+     */
     std::string_view MappedFile::view() const noexcept {
         if (!data || size == 0) return {};
         return std::string_view(static_cast<const char*>(data), size);
     }
 
+    /**
+     * @brief Cleans up memory mapping and closes open file descriptors.
+     */
     MappedFile::~MappedFile() {
     #ifdef _WIN32
         if (data) UnmapViewOfFile(data);
@@ -78,6 +107,10 @@ namespace octane::utils
     #endif
     }
 
+    /**
+     * @brief Move constructor transferring file handles and mapped memory pointer.
+     * @param o Source MappedFile instance.
+     */
     MappedFile::MappedFile(MappedFile&& o) noexcept 
         : data(o.data), size(o.size)
     #ifdef _WIN32
@@ -96,6 +129,11 @@ namespace octane::utils
     #endif
     }
 
+    /**
+     * @brief Move assignment operator for MappedFile.
+     * @param o Source MappedFile instance.
+     * @return Reference to `*this`.
+     */
     MappedFile& MappedFile::operator=(MappedFile&& o) noexcept {
         if (this != &o) {
             this->~MappedFile();

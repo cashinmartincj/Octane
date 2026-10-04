@@ -1,3 +1,30 @@
+/**
+ * @file TcpConnection.h
+ * @brief Asio-backed asynchronous TCP connection handler with rolling ring-buffer parsing.
+ *
+ * @details
+ * `TcpConnection` provides an alternative / fallback TCP connection handler utilizing
+ * standalone Boost.Asio asynchronous sockets. It demonstrates the same zero-overhead protocol
+ * semantics as the primary `IoUringContext` engine:
+ *
+ * Architectural Features:
+ * - **Rolling Ring Buffer:** Maintains a 64KB connection buffer (`buffer_`) with in-place memmove
+ *   compaction, parsing request headers and streaming bodies with minimal heap churn.
+ * - **HTTP Pipelining:** If additional request bytes already reside in the buffer after dispatching
+ *   a response, `process_input()` immediately cycles to fulfill the next request.
+ * - **Scatter-Gather Vectored Writes:** Emits HTTP response headers and bodies using `asio::async_write`
+ *   with a 2-element `asio::const_buffer` array, avoiding extra intermediate buffer copies.
+ * - **Keep-Alive Lifecycles:** Tracks `limits_.max_requests_per_connection` and connection headers
+ *   to gracefully terminate or reuse sockets.
+ *
+ * Where this is imported / used:
+ * - Direct Include: `#include "transport/TcpConnection.h"`
+ * - Testing & Fallbacks: Used in Asio-based connection test cases and non-Linux deployment environments.
+ *
+ * @author Octane Framework Team / FitOps Backend Core
+ * @date 2026
+ */
+
 #pragma once
 #include <asio.hpp>
 #include <algorithm>
@@ -13,32 +40,44 @@
 namespace octane::transport {
 using asio::ip::tcp;
 
+/**
+ * @class TcpConnection
+ * @brief Manages the state and I/O lifecycle of a single Asio-based HTTP client connection.
+ */
 class TcpConnection : public std::enable_shared_from_this<TcpConnection> {
-    tcp::socket socket_;
-    core::RequestDispatcher dispatcher_;
-    HttpLimits limits_;
-    std::function<void(std::size_t)> on_close_;
-    std::size_t id_ = 0;
+    tcp::socket socket_;                     ///< Asio TCP socket
+    core::RequestDispatcher dispatcher_;     ///< Request-to-route dispatch pipeline
+    HttpLimits limits_;                      ///< Protocol and sizing boundaries
+    std::function<void(std::size_t)> on_close_; ///< Callback invoked upon connection termination
+    std::size_t id_ = 0;                     ///< Monotonic connection identifier
 
     // Rolling ring buffer
-    static constexpr std::size_t BUFFER_SIZE = 65536;
-    std::vector<char> buffer_;
-    std::size_t read_pos_ = 0;
-    std::size_t write_pos_ = 0;
+    static constexpr std::size_t BUFFER_SIZE = 65536; ///< 64KB initial socket read buffer
+    std::vector<char> buffer_;              ///< Contiguous socket buffer
+    std::size_t read_pos_ = 0;              ///< Read offset of unconsumed bytes
+    std::size_t write_pos_ = 0;             ///< Offset of valid received bytes
 
-    std::string header_payload_;
-    std::string_view body_payload_;
-    std::string owned_body_storage_;
+    std::string header_payload_;            ///< Serialized response headers
+    std::string_view body_payload_;         ///< Active response body view
+    std::string owned_body_storage_;        ///< Storage for moved dynamic body responses
 
-    HttpRequest request_;
-    std::size_t header_size_ = 0;
-    std::size_t requests_ = 0;
+    HttpRequest request_;                   ///< Inbound parsed request
+    std::size_t header_size_ = 0;           ///< Header bytes size including CRLFCRLF
+    std::size_t requests_ = 0;              ///< Requests processed on this connection
 
     enum class Phase : uint8_t { headers, body, writing, closed } phase_ = Phase::headers;
-    bool draining_ = false;
-    bool close_after_write_ = false;
+    bool draining_ = false;                 ///< Server shutdown draining flag
+    bool close_after_write_ = false;        ///< Connection close flag
 
 public:
+    /**
+     * @brief Constructs a TcpConnection wrapping an accepted Asio TCP socket.
+     * @param socket Connected client TCP socket.
+     * @param router Application Router instance.
+     * @param limits Protocol boundaries and timeouts.
+     * @param id Monotonic connection identifier.
+     * @param on_close Callback invoked upon socket closure.
+     */
     TcpConnection(tcp::socket socket, Router& router, const HttpLimits& limits,
                   std::size_t id, std::function<void(std::size_t)> on_close)
         : socket_(std::move(socket)),
@@ -54,16 +93,26 @@ public:
         socket_.set_option(asio::socket_base::receive_buffer_size(65536), ec);
     }
 
+    /**
+     * @brief Starts the asynchronous connection read loop.
+     */
     void start() {
         begin_request();
     }
 
+    /**
+     * @brief Requests graceful or immediate shutdown of the connection.
+     * @param force When true, terminates immediately without draining active writes.
+     */
     void stop(bool force = false) {
         draining_ = true;
         if (force || phase_ == Phase::headers) close();
     }
 
 private:
+    /**
+     * @brief Closes the underlying socket and notifies the parent server.
+     */
     void close() {
         if (phase_ == Phase::closed) return;
         phase_ = Phase::closed;
@@ -78,6 +127,9 @@ private:
         }
     }
 
+    /**
+     * @brief Initializes state for a new incoming HTTP request on a keep-alive connection.
+     */
     void begin_request() {
         if (phase_ == Phase::closed) return;
         if (draining_) { close(); return; }
@@ -88,6 +140,9 @@ private:
         process_input();
     }
 
+    /**
+     * @brief Inspects buffered bytes, parses HTTP headers/body, and dispatches to handler.
+     */
     void process_input() {
         while (phase_ != Phase::closed && phase_ != Phase::writing) {
             std::string_view unconsumed(buffer_.data() + read_pos_, write_pos_ - read_pos_);
@@ -155,6 +210,9 @@ private:
         }
     }
 
+    /**
+     * @brief Compacts buffer and triggers async_read_some from the client socket.
+     */
     void read_more() {
         if (read_pos_ > 0 && (buffer_.size() - write_pos_ < 4096)) {
             std::size_t remaining = write_pos_ - read_pos_;
@@ -182,6 +240,10 @@ private:
             });
     }
 
+    /**
+     * @brief Transmits an immediate HTTP error response and flags socket for termination.
+     * @param status HTTP error status code (e.g. 400, 431).
+     */
     void fail(int status) {
         if (phase_ == Phase::closed) return;
         try {
@@ -197,6 +259,9 @@ private:
         }
     }
 
+    /**
+     * @brief Transmits response headers and body fragments asynchronously over the socket.
+     */
     void write() {
         phase_ = Phase::writing;
 

@@ -1,12 +1,33 @@
-// examples/static_files.cpp
+/**
+ * @file main.cpp
+ * @brief 01_hello_world — Static file serving and JSON API example for Octane.
+ *
+ * @details
+ * Demonstrates:
+ * - CRTP route handlers (`octane::routes::Get<T>`)
+ * - Virtual memory zero-copy static asset serving using `octane::utils::MappedFile`
+ * - Static HTML, CSS, JavaScript, and JSON endpoint registration
+ *
+ * Routes registered:
+ * - GET `/`          -> serves `index.html` via `res.html_view(...)` (zero copy)
+ * - GET `/style.css` -> serves `style.css`
+ * - GET `/app.js`    -> serves `app.js`
+ * - GET `/api/hello` -> returns JSON payload
+ *
+ * @author Octane Framework Team / FitOps Backend Core
+ * @date 2026
+ */
 
-#include "App.h"
+#include "Octane.h"
 #include "RouteBase.h"
 #include "FileHandle.h"
 #include <filesystem>
+#include <iostream>
 
-// using namespace octane;
-
+/**
+ * @brief Resolves the directory path containing the current executing binary.
+ * @return Absolute filesystem path to the executable's directory.
+ */
 static std::string exe_dir() {
 #ifdef _WIN32
     char result[1024];
@@ -27,6 +48,10 @@ static std::string exe_dir() {
 #endif
 }
 
+/**
+ * @class GetHtml
+ * @brief Serves index.html via memory-mapped zero-copy view.
+ */
 class GetHtml : public octane::routes::Get<GetHtml> {
 public:
     void handle(const octane::HttpRequest& req, octane::HttpResponse& res) {
@@ -48,6 +73,10 @@ public:
     }
 };
 
+/**
+ * @class GetCss
+ * @brief Serves style.css stylesheet.
+ */
 class GetCss : public octane::routes::Get<GetCss> {
 public:
     void handle(const octane::HttpRequest& req, octane::HttpResponse& res) {
@@ -56,6 +85,10 @@ public:
     }
 };
 
+/**
+ * @class GetJs
+ * @brief Serves client application JavaScript file.
+ */
 class GetJs : public octane::routes::Get<GetJs> {
 public:
     void handle(const octane::HttpRequest& req, octane::HttpResponse& res) {
@@ -64,6 +97,10 @@ public:
     }
 };
 
+/**
+ * @class GetHello
+ * @brief Simple JSON greeting endpoint demonstrating microsecond latency.
+ */
 class GetHello : public octane::routes::Get<GetHello> {
 public:
     void handle(const octane::HttpRequest& req, octane::HttpResponse& res) {
@@ -71,8 +108,11 @@ public:
     }
 };
 
+/**
+ * @brief Server main entry point for the 01_hello_world example.
+ */
 int main() {
-    octane::App app;
+    octane::init app;
 
     app.get<GetHtml> ("/");
     app.get<GetCss>  ("/style.css");
