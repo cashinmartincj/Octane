@@ -33,12 +33,48 @@
 #include <memory>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include "../HttpLimits.h"
 #include "../HttpParser.h"
 #include "../core/RequestDispatcher.h"
+#include "ExecutionQueue.h"
 
 namespace octane::transport {
 using asio::ip::tcp;
+
+class EpollExecutionQueues {
+public:
+    explicit EpollExecutionQueues(const ExecutionQueueOptions& options)
+        : options_(options) {}
+
+    bool submit(const HandlerExecution& execution, std::function<void()> job) {
+        std::string key;
+        std::size_t threads = 0;
+        std::size_t capacity = 0;
+        if (execution.mode == HandlerExecutionMode::SharedBlocking) {
+            key = "shared";
+            threads = options_.shared_threads_per_shard;
+            capacity = options_.shared_capacity;
+        } else if (execution.mode == HandlerExecutionMode::Named) {
+            key = "named:" + execution.queue_name;
+            for (const auto& configured : options_.named) {
+                if (configured.name == execution.queue_name) {
+                    threads = configured.threads_per_shard;
+                    capacity = configured.capacity;
+                    break;
+                }
+            }
+        }
+        if (!threads || !capacity) return false;
+        auto& queue = queues_[key];
+        if (!queue) queue = std::make_unique<detail::BoundedExecutionQueue>(threads, capacity);
+        return queue->submit(std::move(job));
+    }
+
+private:
+    ExecutionQueueOptions options_;
+    std::unordered_map<std::string, std::unique_ptr<detail::BoundedExecutionQueue>> queues_;
+};
 
 /**
  * @class TcpConnection
@@ -46,10 +82,13 @@ using asio::ip::tcp;
  */
 class TcpConnection : public std::enable_shared_from_this<TcpConnection> {
     tcp::socket socket_;                     ///< Asio TCP socket
+    asio::steady_timer deadline_timer_;
     core::RequestDispatcher dispatcher_;     ///< Request-to-route dispatch pipeline
+    Router& router_;
     HttpLimits limits_;                      ///< Protocol and sizing boundaries
     std::function<void(std::size_t)> on_close_; ///< Callback invoked upon connection termination
     std::size_t id_ = 0;                     ///< Monotonic connection identifier
+    std::shared_ptr<EpollExecutionQueues> execution_queues_;
 
     // Rolling ring buffer
     static constexpr std::size_t BUFFER_SIZE = 65536; ///< 64KB initial socket read buffer
@@ -65,7 +104,7 @@ class TcpConnection : public std::enable_shared_from_this<TcpConnection> {
     std::size_t header_size_ = 0;           ///< Header bytes size including CRLFCRLF
     std::size_t requests_ = 0;              ///< Requests processed on this connection
 
-    enum class Phase : uint8_t { headers, body, writing, closed } phase_ = Phase::headers;
+    enum class Phase : uint8_t { headers, body, handling, writing, closed } phase_ = Phase::headers;
     bool draining_ = false;                 ///< Server shutdown draining flag
     bool close_after_write_ = false;        ///< Connection close flag
 
@@ -79,12 +118,16 @@ public:
      * @param on_close Callback invoked upon socket closure.
      */
     TcpConnection(tcp::socket socket, Router& router, const HttpLimits& limits,
-                  std::size_t id, std::function<void(std::size_t)> on_close)
+                  std::size_t id, std::function<void(std::size_t)> on_close,
+                  std::shared_ptr<EpollExecutionQueues> execution_queues = nullptr)
         : socket_(std::move(socket)),
+          deadline_timer_(socket_.get_executor()),
           dispatcher_(router),
+          router_(router),
           limits_(limits),
           on_close_(std::move(on_close)),
           id_(id),
+          execution_queues_(std::move(execution_queues)),
           buffer_(BUFFER_SIZE) {
         
         asio::error_code ec;
@@ -118,6 +161,7 @@ private:
         phase_ = Phase::closed;
         
         asio::error_code ec;
+        deadline_timer_.cancel(ec);
         socket_.shutdown(tcp::socket::shutdown_both, ec);
         socket_.close(ec);
         
@@ -137,14 +181,23 @@ private:
         phase_ = Phase::headers;
         header_size_ = 0;
         request_ = {};
+        arm_deadline(limits_.read_timeout);
         process_input();
+    }
+
+    void arm_deadline(std::chrono::milliseconds timeout) {
+        deadline_timer_.expires_after(timeout);
+        auto self = shared_from_this();
+        deadline_timer_.async_wait([self](const asio::error_code& error) {
+            if (!error) self->close();
+        });
     }
 
     /**
      * @brief Inspects buffered bytes, parses HTTP headers/body, and dispatches to handler.
      */
     void process_input() {
-        while (phase_ != Phase::closed && phase_ != Phase::writing) {
+        while (phase_ != Phase::closed && phase_ != Phase::writing && phase_ != Phase::handling) {
             std::string_view unconsumed(buffer_.data() + read_pos_, write_pos_ - read_pos_);
 
             if (phase_ == Phase::headers) {
@@ -180,8 +233,6 @@ private:
             close_after_write_ = draining_ || !request_.keep_alive ||
                                  (++requests_ >= limits_.max_requests_per_connection);
 
-            HttpResponse response = dispatcher_.dispatch_response(request_, close_after_write_);
-
             read_pos_ += total_req_bytes;
             if (read_pos_ == write_pos_) {
                 read_pos_ = 0;
@@ -189,9 +240,66 @@ private:
             }
 
             const bool is_head = (request_.method == HttpMethod::HEAD);
+            asio::error_code ignored;
+            deadline_timer_.cancel(ignored);
+            const HandlerRoute* route = nullptr;
+            if (router_.match(request_, route) &&
+                route->execution.mode != HandlerExecutionMode::Inline) {
+                std::string raw_request(unconsumed.substr(0, total_req_bytes));
+                phase_ = Phase::handling;
+                auto self = shared_from_this();
+                const bool submitted = execution_queues_ && execution_queues_->submit(
+                    route->execution,
+                    [self, raw = std::move(raw_request), is_head]() mutable {
+                        HttpResponse response;
+                        bool failed = false;
+                        try {
+                            const auto header_end = raw.find("\r\n\r\n");
+                            const auto header_size = header_end + 4;
+                            auto request = HttpParser::parse_headers(
+                                std::string_view(raw).substr(0, header_size), self->limits_);
+                            HttpParser::set_body(request, std::string_view(raw).substr(
+                                header_size, request.content_length));
+                            const HandlerRoute* matched = nullptr;
+                            if (!self->router_.match(request, matched) || !matched)
+                                response.status(404).text("Not Found");
+                            else
+                                matched->handler(request, response);
+                        } catch (...) {
+                            response.status(500).text("Internal Server Error");
+                            failed = true;
+                        }
+                        asio::post(self->socket_.get_executor(),
+                            [self, response = std::move(response), is_head, failed]() mutable {
+                                if (self->phase_ == Phase::closed) return;
+                                self->close_after_write_ = self->close_after_write_ || failed;
+                                self->prepare_response(std::move(response), is_head);
+                            });
+                    });
+                if (!submitted) {
+                    phase_ = Phase::body;
+                    fail(503);
+                }
+                return;
+            }
+
+            HttpResponse response = dispatcher_.dispatch_response(request_, close_after_write_);
+            prepare_response(std::move(response), is_head);
+            return;
+        }
+    }
+
+    void prepare_response(HttpResponse response, bool is_head) {
+            for (const auto& [name, value] : response.headers) {
+                if (CaseInsensitiveEqual{}(name, "connection") &&
+                    HttpParser::contains_token(value, "close")) {
+                    close_after_write_ = true;
+                    break;
+                }
+            }
             header_payload_ = response.serialize_headers(close_after_write_);
 
-            if (is_head) {
+            if (is_head || response.status_code == 204 || response.status_code == 304) {
                 body_payload_ = {};
                 owned_body_storage_.clear();
             } else if (response.body_type == HttpResponse::BodyType::Mapped) {
@@ -206,8 +314,6 @@ private:
             }
 
             write();
-            return;
-        }
     }
 
     /**
@@ -264,6 +370,7 @@ private:
      */
     void write() {
         phase_ = Phase::writing;
+        arm_deadline(limits_.write_timeout);
 
         std::array<asio::const_buffer, 2> write_buffers = {
             asio::buffer(header_payload_),
@@ -274,6 +381,9 @@ private:
             socket_, write_buffers,
             [self = shared_from_this()](const asio::error_code& ec, std::size_t) {
                 if (self->phase_ == Phase::closed) return;
+
+                asio::error_code ignored;
+                self->deadline_timer_.cancel(ignored);
 
                 self->header_payload_.clear();
                 self->owned_body_storage_.clear();

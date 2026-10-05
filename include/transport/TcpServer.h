@@ -31,11 +31,13 @@
 
 #include "HttpLimits.h"
 #include "IoUringContext.h"
+#include "EpollContext.h"
 #include "Router.h"
 #include "ExecutionQueue.h"
 
 #include <atomic>
 #include <cerrno>
+#include <cstdlib>
 #include <cstring>
 #include <print>
 #include <exception>
@@ -56,11 +58,15 @@
 
 namespace octane::transport {
 
+enum class TransportBackend { Automatic, IoUring, Epoll };
+
 /**
  * @struct TcpServerOptions
  * @brief Runtime options configuring Linux kernel io_uring, worker pinning, and execution pools.
  */
 struct TcpServerOptions {
+    /// Automatic probes io_uring once and falls back to epoll when unavailable.
+    TransportBackend transport_backend{TransportBackend::Automatic};
     /// Depth of the io_uring submission and completion queues per worker (default: 256)
     unsigned int ring_queue_depth{256};
 
@@ -158,6 +164,7 @@ public:
         stop_requested_->store(false, std::memory_order_release);
         worker_error_ = nullptr;
         active_connections_->store(0, std::memory_order_relaxed);
+        selected_backend_ = select_backend(num_threads_);
 
         sigset_t shutdown_signals;
         sigemptyset(&shutdown_signals);
@@ -189,10 +196,10 @@ public:
             }
 
             if (::isatty(STDOUT_FILENO)) {
-                std::println("\033[1;32m● Octane (io_uring) listening on port {}\033[0m", port_);
+                std::println("\033[1;32m● Octane ({}) listening on port {}\033[0m", backend_name(), port_);
             } else {
                 // Keep redirected logs machine-readable and free of ANSI bytes.
-                std::println("Octane (io_uring) listening on port {}", port_);
+                std::println("Octane ({}) listening on port {}", backend_name(), port_);
             }
             std::fflush(stdout);
             const std::vector<int> worker_cpus =
@@ -240,6 +247,38 @@ private:
     inline static std::atomic_bool signal_owner_{false}; ///< Single server signal lock
     std::mutex worker_error_mutex_;                   ///< Protects worker_error_
     std::exception_ptr worker_error_;                 ///< Captures worker thread exceptions
+    TransportBackend selected_backend_{TransportBackend::IoUring};
+
+    TransportBackend select_backend(std::size_t worker_count) const {
+        if (options_.transport_backend != TransportBackend::Automatic)
+            return options_.transport_backend;
+        if (const char* requested = std::getenv("OCTANE_TRANSPORT")) {
+            const std::string_view value(requested);
+            if (value == "epoll") return TransportBackend::Epoll;
+            if (value == "io_uring") return TransportBackend::IoUring;
+            if (!value.empty() && value != "auto")
+                throw std::invalid_argument(
+                    "OCTANE_TRANSPORT must be auto, io_uring, or epoll");
+        }
+        std::vector<io_uring> probes(worker_count);
+        std::size_t initialized = 0;
+        int result = 0;
+        for (; initialized < probes.size(); ++initialized) {
+            result = io_uring_queue_init(options_.ring_queue_depth,
+                                         &probes[initialized], 0);
+            if (result < 0) break;
+        }
+        for (std::size_t i = 0; i < initialized; ++i)
+            io_uring_queue_exit(&probes[i]);
+        if (result == 0) return TransportBackend::IoUring;
+        std::println(stderr, "io_uring unavailable ({}); falling back to epoll",
+                     std::strerror(-result));
+        return TransportBackend::Epoll;
+    }
+
+    const char* backend_name() const noexcept {
+        return selected_backend_ == TransportBackend::IoUring ? "io_uring" : "epoll";
+    }
 
     /**
      * @brief Dedicated thread waiting synchronously for SIGINT or SIGTERM via sigtimedwait.
@@ -362,13 +401,21 @@ private:
     void run_worker(int server_fd, int cpu) noexcept {
         try {
             pin_current_worker(cpu);
-            IoUringContext ring_context(server_fd, router_, limits_,
-                                        active_connections_, stop_requested_.get(),
-                                        options_.ring_queue_depth,
-                                        options_.execution_queues);
-            ring_context.run();
+            if (selected_backend_ == TransportBackend::IoUring) {
+                IoUringContext ring_context(server_fd, router_, limits_,
+                                            active_connections_, stop_requested_.get(),
+                                            options_.ring_queue_depth,
+                                            options_.execution_queues);
+                ring_context.run();
+            } else {
+                EpollContext epoll_context(server_fd, router_, limits_,
+                                           active_connections_, stop_requested_.get(),
+                                           options_.execution_queues);
+                epoll_context.run();
+                server_fd = -1; // the Asio acceptor owns and closes the descriptor
+            }
         } catch (const std::exception& error) {
-            std::println(stderr, "io_uring worker stopped: {}", error.what());
+            std::println(stderr, "{} worker stopped: {}", backend_name(), error.what());
             {
                 std::lock_guard lock(worker_error_mutex_);
                 if (!worker_error_) worker_error_ = std::current_exception();
@@ -381,7 +428,7 @@ private:
             }
             stop_requested_->store(true, std::memory_order_release);
         }
-        ::close(server_fd);
+        if (server_fd >= 0) ::close(server_fd);
     }
 };
 

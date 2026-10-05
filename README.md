@@ -2,7 +2,11 @@
 
 A high-performance async HTTP/1.1 web framework written in C++20.
 
-Built on Linux `io_uring` with an isolated thread-per-core architecture (`SO_REUSEPORT`), a hybrid zero-allocation router (O(1) hash map for static routes, trie for dynamic), zero-copy mapped-body serving, scatter-gather I/O, and CRTP-based route handlers with no virtual dispatch overhead.
+Built on Linux with an automatic `io_uring`-first transport and an Asio/epoll
+fallback, using an isolated thread-per-core architecture (`SO_REUSEPORT`), a
+hybrid zero-allocation router (O(1) hash map for static routes, trie for
+dynamic), zero-copy mapped-body serving, scatter-gather I/O, and CRTP-based
+route handlers with no virtual dispatch overhead.
 
 Performance needs to be measured for your workload. See the transport limits, supported protocol behavior, and reproducible checks below.
 
@@ -43,8 +47,9 @@ Performance needs to be measured for your workload. See the transport limits, su
 
 - C++20
 - CMake 3.20+
-- Linux with `io_uring` support
+- Linux (`io_uring` is preferred; epoll is the runtime fallback)
 - `liburing` and `pkg-config`
+- Standalone Asio (fetched at the pinned CMake revision)
 - Platform threads (`pthreads`)
 
 Install the development package for `liburing` before configuring the default backend.
@@ -55,7 +60,7 @@ Install the development package for `liburing` before configuring the default ba
 
 | Platform | Status |
 | --- | --- |
-| Linux | ✅ Native `io_uring` backend with `SO_REUSEPORT` |
+| Linux | ✅ Automatic `io_uring`, with Asio/epoll fallback and `SO_REUSEPORT` |
 | macOS | ❌ Native backend unavailable |
 | Windows | ❌ Native backend unavailable |
 
@@ -110,6 +115,13 @@ transport.execution_queues.shared_capacity = 1024;
 transport.execution_queues.named.push_back({"database", 2, 256});
 app.listen(8080, 8, limits, transport);
 ```
+
+The default `Automatic` mode probes the requested number and depth of rings
+before opening the server. If the kernel or container policy rejects
+`io_uring`, every worker uses epoll for that process. The selected backend is
+printed in the startup log. For diagnostics or a controlled rollout, set
+`OCTANE_TRANSPORT=auto`, `OCTANE_TRANSPORT=io_uring`, or
+`OCTANE_TRANSPORT=epoll`; an invalid value fails startup.
 
 Disable worker pinning when an external runtime manages affinity. Queue depth should be measured under the intended concurrency; making it very large consumes additional locked kernel memory and is not automatically faster.
 

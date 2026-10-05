@@ -29,6 +29,11 @@ int main() {
     options.bind_address = "127.0.0.1";
     options.validate();
 
+    options.transport_backend = octane::transport::TransportBackend::Epoll;
+    options.validate();
+    options.transport_backend = octane::transport::TransportBackend::IoUring;
+    options.validate();
+
     check(rejects_address(""));
     check(rejects_address("localhost"));
     check(rejects_address("127.0.0.1:8080"));

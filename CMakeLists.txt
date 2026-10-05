@@ -11,16 +11,16 @@ option(OCTANE_USE_IO_URING "Use native io_uring backend instead of Asio" ON)
 if(OCTANE_USE_IO_URING)
     find_package(PkgConfig REQUIRED)
     pkg_check_modules(liburing REQUIRED liburing)
-else()
-    # ── fetch asio ────────────────────────────────
-    include(FetchContent)
-    FetchContent_Declare(
-        asio
-        GIT_REPOSITORY https://github.com/chriskohlhoff/asio
-        GIT_TAG        asio-1-28-0
-    )
-    FetchContent_MakeAvailable(asio)
 endif()
+
+# Asio is compiled into every build as the Linux epoll runtime fallback.
+include(FetchContent)
+FetchContent_Declare(
+    asio
+    GIT_REPOSITORY https://github.com/chriskohlhoff/asio
+    GIT_TAG        asio-1-28-0
+)
+FetchContent_MakeAvailable(asio)
 
 # ── library ───────────────────────────────────
 add_library(octane_lib
@@ -33,15 +33,15 @@ target_include_directories(octane_lib PUBLIC
     $<INSTALL_INTERFACE:include>
 )
 
+target_include_directories(octane_lib SYSTEM PUBLIC $<BUILD_INTERFACE:${asio_SOURCE_DIR}/asio/include>)
+target_compile_definitions(octane_lib PUBLIC ASIO_STANDALONE _WIN32_WINNT=0x0601)
+
 if(OCTANE_USE_IO_URING)
     target_include_directories(octane_lib PUBLIC ${liburing_INCLUDE_DIRS})
     target_link_libraries(octane_lib PUBLIC ${liburing_LIBRARIES} pthread)
     target_compile_definitions(octane_lib PUBLIC OCTANE_USE_IO_URING)
-else()
-    target_include_directories(octane_lib PUBLIC $<BUILD_INTERFACE:${asio_SOURCE_DIR}/asio/include>)
-    target_compile_definitions(octane_lib PUBLIC ASIO_STANDALONE _WIN32_WINNT=0x0601)
-    target_link_libraries(octane_lib PUBLIC pthread)
 endif()
+target_link_libraries(octane_lib PUBLIC pthread)
 
 # ── dev mode ──────────────────────────────────
 option(OCTANE_DEV_MODE "Enable live reload" OFF)
