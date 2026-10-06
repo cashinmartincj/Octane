@@ -62,6 +62,9 @@
 #include "HttpResponse.h"
 #include "Router.h"
 #include "transport/ExecutionQueue.h"
+#include "websocket/WebSocket.h"
+#include "websocket/WebSocketHandshake.h"
+#include "websocket/WebSocketSession.h"
 
 namespace octane::transport {
 
@@ -112,6 +115,13 @@ struct ConnectionState {
     AsyncContext* pending{nullptr};         ///< Pointer to current in-flight SQE context
     std::chrono::steady_clock::time_point read_deadline;  ///< Read timeout limit
     std::chrono::steady_clock::time_point write_deadline; ///< Write timeout limit
+
+    bool is_websocket{false};               ///< True if connection has upgraded to WebSocket
+    bool is_websocket_upgrade{false};       ///< True if pending write is 101 WS upgrade
+    const WebSocketConfig* active_ws_config{nullptr};
+    std::shared_ptr<websocket::WebSocketSession> ws_session;
+    std::deque<std::string> ws_write_queue;
+    bool ws_writing{false};
 
     /// Returns unconsumed input bytes available for parsing
     [[nodiscard]] std::size_t available_input() const noexcept {
@@ -856,6 +866,19 @@ private:
             HttpParser::set_body(request, available.substr(
                 header_size, request.content_length));
 
+            // WebSocket Upgrade Detection
+            const WebSocketConfig* ws_config = router_ ? router_->find_ws(request.path) : nullptr;
+            if (ws_config && websocket::is_upgrade_request(request)) {
+                HttpResponse ws_response;
+                if (websocket::make_upgrade_response(request, ws_response)) {
+                    connection->is_websocket_upgrade = true;
+                    connection->active_ws_config = ws_config;
+                    connection->read_position += request_size;
+                    begin_response(connection, ws_response, false, false);
+                    return;
+                }
+            }
+
             HttpResponse response;
             bool handler_failed = false;
             const HandlerRoute* route = nullptr;
@@ -901,6 +924,77 @@ private:
             send_error(connection, error.status);
         } catch (...) {
             send_error(connection, 500);
+        }
+    }
+
+    void start_websocket(ConnectionState* connection) {
+        connection->is_websocket_upgrade = false;
+        connection->is_websocket = true;
+        connection->response_headers.clear();
+        connection->owned_body.clear();
+        connection->response_body = {};
+        connection->write_offset = 0;
+        connection->write_size = 0;
+
+        const int fd = connection->fd;
+        connection->ws_session = std::make_shared<websocket::WebSocketSession>(
+            connection->active_ws_config ? *connection->active_ws_config : WebSocketConfig{},
+            [this, fd](std::string frame) {
+                auto it = connections_.find(fd);
+                if (it != connections_.end() && !it->second->closed) {
+                    it->second->ws_write_queue.push_back(std::move(frame));
+                    flush_websocket_writes(it->second.get());
+                }
+            },
+            [this, fd](websocket::CloseCode, std::string_view) {
+                auto it = connections_.find(fd);
+                if (it != connections_.end() && !it->second->closed) {
+                    if (it->second->ws_write_queue.empty() && !it->second->ws_writing) {
+                        close_connection(it->second.get());
+                    } else {
+                        it->second->close_after_write = true;
+                    }
+                }
+            }
+        );
+
+        connection->ws_session->on_open();
+        process_websocket_input(connection);
+    }
+
+    void process_websocket_input(ConnectionState* connection) {
+        if (!connection || connection->closed || !connection->ws_session) return;
+
+        if (connection->available_input() > 0) {
+            std::string unconsumed(connection->input_view());
+            connection->input.clear();
+            connection->read_position = 0;
+            connection->ws_session->feed(unconsumed);
+        }
+
+        if (!connection->closed && connection->ws_session->is_open() && !connection->pending) {
+            if (!queue_read(connection)) {
+                close_connection(connection);
+            }
+        }
+    }
+
+    void flush_websocket_writes(ConnectionState* connection) {
+        if (!connection || connection->closed || connection->ws_writing ||
+            connection->ws_write_queue.empty() || connection->pending) return;
+
+        connection->ws_writing = true;
+        connection->response_headers = std::move(connection->ws_write_queue.front());
+        connection->ws_write_queue.pop_front();
+        connection->response_body = {};
+        connection->owned_body.clear();
+        connection->write_offset = 0;
+        connection->write_size = connection->response_headers.size();
+
+        connection->write_deadline = std::chrono::steady_clock::now() + limits_.write_timeout;
+        set_deadline(connection, OperationType::Write, connection->write_deadline);
+        if (!queue_write(connection)) {
+            close_connection(connection);
         }
     }
 
@@ -976,7 +1070,11 @@ private:
                 compact_input(*connection);
                 connection->input.append(connection->read_buffer.data(),
                                          static_cast<std::size_t>(result));
-                process_input(connection);
+                if (connection->is_websocket) {
+                    process_websocket_input(connection);
+                } else {
+                    process_input(connection);
+                }
                 break;
             }
             case OperationType::Write: {
@@ -991,6 +1089,20 @@ private:
                     if (!queue_write(connection)) close_connection(connection);
                 } else if (connection->close_after_write || shutting_down_) {
                     close_connection(connection);
+                } else if (connection->is_websocket_upgrade) {
+                    start_websocket(connection);
+                } else if (connection->is_websocket) {
+                    connection->ws_writing = false;
+                    connection->response_headers.clear();
+                    connection->write_offset = 0;
+                    connection->write_size = 0;
+                    if (!connection->ws_write_queue.empty()) {
+                        flush_websocket_writes(connection);
+                    } else if (connection->close_after_write) {
+                        close_connection(connection);
+                    } else if (!connection->pending && connection->ws_session && connection->ws_session->is_open()) {
+                        if (!queue_read(connection)) close_connection(connection);
+                    }
                 } else {
                     connection->response_headers.clear();
                     connection->owned_body.clear();

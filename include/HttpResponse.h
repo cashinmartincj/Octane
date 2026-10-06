@@ -71,6 +71,7 @@ namespace octane
      */
     inline constexpr std::string_view get_status_text_sv(int code) noexcept {
         switch (code) {
+            case 101: return "Switching Protocols";
             case 200: return "OK";
             case 201: return "Created";
             case 204: return "No Content";
@@ -258,7 +259,7 @@ namespace octane
          * @throws std::invalid_argument If status_code is outside [200, 599] or headers contain illegal chars.
          */
         [[nodiscard]] std::string serialize_headers(bool close = false) const {
-            if (status_code < 200 || status_code > 599) throw std::invalid_argument("Unsupported response status");
+            if (status_code != 101 && (status_code < 200 || status_code > 599)) throw std::invalid_argument("Unsupported response status");
             std::string_view stext = get_status_text_sv(status_code);
             auto body_ret = active_body();
 
@@ -267,6 +268,18 @@ namespace octane
             
             response.append("HTTP/1.1 ").append(std::to_string(status_code)).append(" ").append(stext).append("\r\n");
             
+            if (status_code == 101) {
+                // 101 Switching Protocols: output custom headers directly (Upgrade, Connection, Sec-WebSocket-Accept)
+                for (const auto& [key, val] : headers) {
+                    if (!valid_header_name(key) || !valid_header_value(val)) {
+                        throw std::invalid_argument("Invalid HTTP response header");
+                    }
+                    response.append(key).append(": ").append(val).append("\r\n");
+                }
+                response.append("\r\n");
+                return response;
+            }
+
             bool custom_content_type = false;
             for (const auto& [key, val] : headers) {
                 if (!valid_header_name(key) || !valid_header_value(val)) {

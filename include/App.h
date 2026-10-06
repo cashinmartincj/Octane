@@ -45,8 +45,22 @@ namespace octane
         App& put    (std::string_view path, Handler h, HandlerExecution e) { router_.put    (path, h, std::move(e)); return *this; }
         App& patch  (std::string_view path, Handler h, HandlerExecution e) { router_.patch  (path, h, std::move(e)); return *this; }
         App& del    (std::string_view path, Handler h, HandlerExecution e) { router_.del    (path, h, std::move(e)); return *this; }
-        App& options(std::string_view path, Handler h, HandlerExecution e) { router_.options(path, h, std::move(e)); return *this; }
         App& head   (std::string_view path, Handler h, HandlerExecution e) { router_.head   (path, h, std::move(e)); return *this; }
+
+        // WebSocket Route Registration
+        App& ws(std::string_view path, WebSocketConfig config) {
+            router_.ws(path, std::move(config));
+            return *this;
+        }
+
+        template<typename SetupFn>
+        requires std::invocable<SetupFn, WebSocketConfig&>
+        App& ws(std::string_view path, SetupFn setup) {
+            WebSocketConfig config;
+            setup(config);
+            router_.ws(path, std::move(config));
+            return *this;
+        }
 
         void listen(
             int port,

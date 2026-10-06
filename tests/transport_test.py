@@ -65,6 +65,42 @@ try:
     request(b'GET /named-throw HTTP/1.1\r\nHost: x\r\n\r\n', 500)
     request(b'GET /missing-queue HTTP/1.1\r\nHost: x\r\n\r\n', 503)
     request(b'GET /close HTTP/1.1\r\nHost: x\r\n\r\n', 200)
+    # Test WebSocket handshake and message exchange
+    with connect() as s:
+        upgrade_req = (
+            b'GET /ws HTTP/1.1\r\n'
+            b'Host: 127.0.0.1\r\n'
+            b'Upgrade: websocket\r\n'
+            b'Connection: Upgrade\r\n'
+            b'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n'
+            b'Sec-WebSocket-Version: 13\r\n\r\n'
+        )
+        s.sendall(upgrade_req)
+        hs_resp = b''
+        while b'\r\n\r\n' not in hs_resp:
+            chunk = s.recv(4096)
+            if not chunk: break
+            hs_resp += chunk
+        assert b'HTTP/1.1 101 Switching Protocols' in hs_resp, hs_resp
+        assert b'Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=' in hs_resp
+
+        # Send a masked text frame: "hello"
+        text = b'hello'
+        mask = b'\x12\x34\x56\x78'
+        masked_payload = bytes([b ^ mask[i % 4] for i, b in enumerate(text)])
+        frame = bytes([0x81, 0x80 | len(text)]) + mask + masked_payload
+        s.sendall(frame)
+
+        # Receive echo from server: unmasked frame with payload "echo:hello"
+        resp_frame = s.recv(4096)
+        assert len(resp_frame) >= 2, resp_frame
+        assert resp_frame[0] == 0x81 # FIN + Text
+        resp_len = resp_frame[1] & 0x7F
+        expected_msg = b'echo:hello'
+        assert resp_len == len(expected_msg)
+        assert resp_frame[2:2 + resp_len] == expected_msg, resp_frame
+
+    time.sleep(.03)
     with connect() as s:
         s.sendall(b'HEAD / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n')
         data = all_bytes(s)

@@ -24,6 +24,12 @@ int main(int argc, char** argv) {
     router.get("/missing-queue", [](auto&, auto& res) {
         res.text("must not run");
     }, octane::HandlerExecution::named("not-configured"));
+    octane::WebSocketConfig ws_cfg;
+    ws_cfg.on_message = [](octane::WebSocket& ws, std::string_view msg, bool is_binary) {
+        if (is_binary) ws.send_binary(msg);
+        else ws.send_text("echo:" + std::string(msg));
+    };
+    router.ws("/ws", std::move(ws_cfg));
     octane::HttpLimits limits;
     if (argc == 1) {
         limits.max_header_bytes = 256;

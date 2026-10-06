@@ -38,6 +38,9 @@
 #include "../HttpParser.h"
 #include "../core/RequestDispatcher.h"
 #include "ExecutionQueue.h"
+#include "../websocket/WebSocket.h"
+#include "../websocket/WebSocketHandshake.h"
+#include "../websocket/WebSocketSession.h"
 
 namespace octane::transport {
 using asio::ip::tcp;
@@ -103,10 +106,14 @@ class TcpConnection : public std::enable_shared_from_this<TcpConnection> {
     HttpRequest request_;                   ///< Inbound parsed request
     std::size_t header_size_ = 0;           ///< Header bytes size including CRLFCRLF
     std::size_t requests_ = 0;              ///< Requests processed on this connection
-
-    enum class Phase : uint8_t { headers, body, handling, writing, closed } phase_ = Phase::headers;
+    enum class Phase : uint8_t { headers, body, handling, writing, websocket, closed } phase_ = Phase::headers;
     bool draining_ = false;                 ///< Server shutdown draining flag
     bool close_after_write_ = false;        ///< Connection close flag
+    bool is_websocket_upgrade_ = false;     ///< True if active response is 101 WS upgrade
+    const WebSocketConfig* active_ws_config_{nullptr}; ///< Matched WS config
+    std::shared_ptr<websocket::WebSocketSession> ws_session_; ///< Active WebSocket session
+    std::deque<std::string> ws_write_queue_;///< Queue of outbound WS frames
+    bool ws_writing_{false};                ///< In-flight WS async_write flag
 
 public:
     /**
@@ -242,6 +249,19 @@ private:
             const bool is_head = (request_.method == HttpMethod::HEAD);
             asio::error_code ignored;
             deadline_timer_.cancel(ignored);
+
+            // WebSocket Upgrade Detection
+            const WebSocketConfig* ws_config = router_.find_ws(request_.path);
+            if (ws_config && websocket::is_upgrade_request(request_)) {
+                HttpResponse ws_response;
+                if (websocket::make_upgrade_response(request_, ws_response)) {
+                    is_websocket_upgrade_ = true;
+                    active_ws_config_ = ws_config;
+                    prepare_response(std::move(ws_response), false);
+                    return;
+                }
+            }
+
             const HandlerRoute* route = nullptr;
             if (router_.match(request_, route) &&
                 route->execution.mode != HandlerExecutionMode::Inline) {
@@ -342,7 +362,11 @@ private:
                     return;
                 }
                 self->write_pos_ += bytes;
-                self->process_input();
+                if (self->phase_ == Phase::websocket) {
+                    self->process_websocket_input();
+                } else {
+                    self->process_input();
+                }
             });
     }
 
@@ -394,6 +418,11 @@ private:
                     return;
                 }
 
+                if (self->is_websocket_upgrade_) {
+                    self->start_websocket();
+                    return;
+                }
+
                 self->phase_ = Phase::headers;
                 self->header_size_ = 0;
                 self->request_ = {};
@@ -403,6 +432,71 @@ private:
                     self->process_input();
                 } else {
                     self->read_more();
+                }
+            });
+    }
+
+    void start_websocket() {
+        phase_ = Phase::websocket;
+        auto self = shared_from_this();
+
+        ws_session_ = std::make_shared<websocket::WebSocketSession>(
+            active_ws_config_ ? *active_ws_config_ : WebSocketConfig{},
+            [self](std::string frame) {
+                asio::post(self->socket_.get_executor(), [self, frame = std::move(frame)]() mutable {
+                    self->ws_write_queue_.push_back(std::move(frame));
+                    self->flush_websocket_writes();
+                });
+            },
+            [self](websocket::CloseCode, std::string_view) {
+                asio::post(self->socket_.get_executor(), [self]() {
+                    if (self->ws_write_queue_.empty() && !self->ws_writing_) {
+                        self->close();
+                    } else {
+                        self->close_after_write_ = true;
+                    }
+                });
+            }
+        );
+
+        ws_session_->on_open();
+        process_websocket_input();
+    }
+
+    void process_websocket_input() {
+        if (phase_ != Phase::websocket || !ws_session_) return;
+
+        if (write_pos_ > read_pos_) {
+            std::string_view unconsumed(buffer_.data() + read_pos_, write_pos_ - read_pos_);
+            read_pos_ = 0;
+            write_pos_ = 0;
+            ws_session_->feed(unconsumed);
+        }
+
+        if (phase_ == Phase::websocket && ws_session_->is_open()) {
+            read_more();
+        }
+    }
+
+    void flush_websocket_writes() {
+        if (ws_writing_ || ws_write_queue_.empty() || phase_ == Phase::closed) return;
+
+        ws_writing_ = true;
+        auto self = shared_from_this();
+        asio::async_write(
+            socket_, asio::buffer(ws_write_queue_.front()),
+            [self](const asio::error_code& ec, std::size_t) {
+                self->ws_writing_ = false;
+                if (self->phase_ == Phase::closed) return;
+                if (ec) {
+                    self->close();
+                    return;
+                }
+                self->ws_write_queue_.pop_front();
+                if (!self->ws_write_queue_.empty()) {
+                    self->flush_websocket_writes();
+                } else if (self->close_after_write_) {
+                    self->close();
                 }
             });
     }

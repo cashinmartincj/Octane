@@ -454,6 +454,34 @@ public:
         return *this;
     }
 
+    // ── WebSocket Route Registrations ────────────────────────────────────
+
+    /**
+     * @brief Registers a WebSocket route with complete callback configuration.
+     * @param path URL pattern.
+     * @param config WebSocket configuration and event callbacks.
+     * @return Reference to this `init` instance for method chaining.
+     */
+    init& ws(std::string_view path, WebSocketConfig config) {
+        router_.ws(path, std::move(config));
+        return *this;
+    }
+
+    /**
+     * @brief Registers a WebSocket route using a fluent configuration builder lambda.
+     * @param path URL pattern.
+     * @param setup Lambda accepting `WebSocketConfig&`.
+     * @return Reference to this `init` instance for method chaining.
+     */
+    template<typename SetupFn>
+    requires std::invocable<SetupFn, WebSocketConfig&>
+    init& ws(std::string_view path, SetupFn setup) {
+        WebSocketConfig config;
+        setup(config);
+        router_.ws(path, std::move(config));
+        return *this;
+    }
+
     // ── Server Execution ─────────────────────────────────────────────────
 
     /**

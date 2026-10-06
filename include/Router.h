@@ -32,6 +32,7 @@
 #include "HttpRequest.h"
 #include "HttpResponse.h"
 #include "HttpTypes.h"
+#include "websocket/WebSocket.h"
 #include <unordered_map>
 #include <string_view>
 #include <string>
@@ -96,6 +97,37 @@ namespace octane
         void options(std::string_view path, Handler h, HandlerExecution e) { add("OPTIONS", path, h, std::move(e)); }
         void head   (std::string_view path, Handler h, HandlerExecution e) { add("HEAD",    path, h, std::move(e)); }
         ///@}
+
+        /** @name WebSocket Route Registrations */
+        ///@{
+        void ws(std::string_view path, WebSocketConfig config) {
+            path_storage_.emplace_back(path);
+            std::string_view persistent_view = path_storage_.back();
+            ws_routes_[persistent_view] = std::move(config);
+        }
+        ///@}
+
+        /**
+         * @brief Checks if a given path is registered as a WebSocket route.
+         */
+        [[nodiscard]] const WebSocketConfig* find_ws(std::string_view path) const noexcept {
+            auto it = ws_routes_.find(path);
+            if (it != ws_routes_.end()) return &it->second;
+
+            // Trailing slash tolerance
+            if (path.size() > 1) {
+                if (path.ends_with('/')) {
+                    std::string_view trimmed(path.data(), path.size() - 1);
+                    auto it_trimmed = ws_routes_.find(trimmed);
+                    if (it_trimmed != ws_routes_.end()) return &it_trimmed->second;
+                } else {
+                    std::string slashed = std::string(path) + "/";
+                    auto it_slashed = ws_routes_.find(slashed);
+                    if (it_slashed != ws_routes_.end()) return &it_slashed->second;
+                }
+            }
+            return nullptr;
+        }
 
         /**
          * @brief Matches an incoming HttpRequest against registered static and dynamic routes.
@@ -162,6 +194,9 @@ namespace octane
 
         /// Stable string backing storage for static route path views
         std::deque<std::string>        path_storage_;
+
+        /// WebSocket routes mapped by path string_view
+        std::unordered_map<std::string_view, WebSocketConfig, StringViewHash, std::equal_to<>> ws_routes_;
 
         /**
          * @brief Inspects a path string to detect parameter wildcards (`:`).
