@@ -45,6 +45,7 @@
 #include "HttpTypes.h"
 #include <cstddef>
 #include <string>
+#include <memory>
 #include <string_view>
 #include <vector>
 #include <unordered_map>
@@ -56,6 +57,7 @@ namespace octane {
  * @brief Represents a fully received and parsed incoming HTTP request.
  */
 struct HttpRequest {
+    std::shared_ptr<void> admission_lifetime;
     /// Declared Content-Length from request headers, or 0 if omitted.
     std::size_t content_length = 0;
 

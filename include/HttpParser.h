@@ -298,7 +298,10 @@ namespace octane
             
             auto [it, inserted] = req.headers.try_emplace(key, value);
             if (!inserted) {
-                if (iequals(key, "content-length") || iequals(key, "host") || iequals(key, "transfer-encoding")) {
+                if (iequals(key, "content-length") || iequals(key, "host") || iequals(key, "transfer-encoding") ||
+                    iequals(key, "sec-websocket-key") || iequals(key, "sec-websocket-version") ||
+                    iequals(key, "origin") || iequals(key, "upgrade") ||
+                    iequals(key, "connection") || iequals(key, "authorization")) {
                     throw HttpParseError(400);
                 }
             }

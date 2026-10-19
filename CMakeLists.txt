@@ -119,11 +119,17 @@ if(BUILD_TESTING)
     target_link_libraries(octane_server_fixture PRIVATE octane_lib)
     add_executable(octane_websocket_tests tests/websocket_tests.cpp)
     target_link_libraries(octane_websocket_tests PRIVATE octane_lib)
+    target_compile_options(octane_websocket_tests PRIVATE -UNDEBUG)
     add_test(NAME websocket_tests COMMAND octane_websocket_tests)
     find_package(Python3 REQUIRED COMPONENTS Interpreter)
     add_test(NAME tcp_transport COMMAND ${Python3_EXECUTABLE}
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/transport_test.py $<TARGET_FILE:octane_server_fixture>)
     set_tests_properties(tcp_transport PROPERTIES TIMEOUT 20)
+    add_executable(octane_websocket_fixture tests/websocket_fixture.cpp)
+    target_link_libraries(octane_websocket_fixture PRIVATE octane_lib)
+    add_test(NAME websocket_transport COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/websocket_transport_test.py $<TARGET_FILE:octane_websocket_fixture>)
+    set_tests_properties(websocket_transport PROPERTIES TIMEOUT 30)
 endif()
 
 option(OCTANE_FUZZING "Build Clang libFuzzer HTTP parser target" OFF)

@@ -39,6 +39,8 @@
 #include <deque>
 #include <array>
 #include <utility>
+#include <limits>
+#include <stdexcept>
 
 namespace octane
 {
@@ -101,6 +103,10 @@ namespace octane
         /** @name WebSocket Route Registrations */
         ///@{
         void ws(std::string_view path, WebSocketConfig config) {
+            if (!config.max_payload_bytes || config.max_payload_bytes > std::numeric_limits<size_t>::max() - 14 ||
+                !config.max_pending_write_bytes || !config.max_pending_write_frames ||
+                config.read_timeout.count() <= 0 || config.close_timeout.count() <= 0)
+                throw std::invalid_argument("WebSocket limits and timeouts must be positive and bounded");
             path_storage_.emplace_back(path);
             std::string_view persistent_view = path_storage_.back();
             ws_routes_[persistent_view] = std::move(config);
@@ -110,7 +116,7 @@ namespace octane
         /**
          * @brief Checks if a given path is registered as a WebSocket route.
          */
-        [[nodiscard]] const WebSocketConfig* find_ws(std::string_view path) const noexcept {
+        [[nodiscard]] const WebSocketConfig* find_ws(std::string_view path) const {
             auto it = ws_routes_.find(path);
             if (it != ws_routes_.end()) return &it->second;
 

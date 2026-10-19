@@ -88,6 +88,8 @@ struct AsyncContext;
  * @brief Represents the complete lifecycle state of an active TCP client connection.
  */
 struct ConnectionState {
+    bool admission_checked{false};
+    std::shared_ptr<void> admission_lifetime;
     int fd{-1};                              ///< Active client socket file descriptor
     std::string input;                      ///< Dynamic buffer for accumulated HTTP request bytes
     std::size_t read_position{0};           ///< Offset of unparsed bytes in `input`
@@ -116,12 +118,17 @@ struct ConnectionState {
     std::chrono::steady_clock::time_point read_deadline;  ///< Read timeout limit
     std::chrono::steady_clock::time_point write_deadline; ///< Write timeout limit
 
+    std::string ws_upgrade_request;
+    bool ws_read_interrupted{false};
     bool is_websocket{false};               ///< True if connection has upgraded to WebSocket
     bool is_websocket_upgrade{false};       ///< True if pending write is 101 WS upgrade
     const WebSocketConfig* active_ws_config{nullptr};
     std::shared_ptr<websocket::WebSocketSession> ws_session;
     std::deque<std::string> ws_write_queue;
     bool ws_writing{false};
+    bool ws_abort{false};
+    bool ws_close_deadline_armed{false};
+    std::size_t ws_pending_write_bytes{0};
 
     /// Returns unconsumed input bytes available for parsing
     [[nodiscard]] std::size_t available_input() const noexcept {
@@ -227,15 +234,18 @@ public:
             throw std::runtime_error("Failed to initialize handler wakeup: " +
                                      std::string(strerror(error)));
         }
+        ws_mailbox_->wake_fd=wake_fd_;
     }
 
     /**
      * @brief Destructor tearing down active connections, eventfd, and the io_uring ring.
      */
     ~IoUringContext() {
+        { std::lock_guard lock(ws_mailbox_->mutex); ws_mailbox_->wake_fd=-1; ws_mailbox_->commands.clear(); }
         executors_.clear();
         for (auto& [fd, connection] : connections_) {
             if (!connection->closed) ::close(fd);
+            if (connection->ws_session) connection->ws_session->transport_closed();
         }
         if (wake_fd_ >= 0) ::close(wake_fd_);
         io_uring_queue_exit(&ring_);
@@ -313,6 +323,50 @@ private:
         bool base_close{false};
         bool handler_failed{false};
     };
+
+    struct WsCommand { int fd; std::uint64_t id; std::string text; bool closing; };
+    struct WsMailbox {
+        std::mutex mutex;
+        std::deque<WsCommand> commands;
+        int wake_fd{-1};
+    };
+    std::shared_ptr<WsMailbox> ws_mailbox_{std::make_shared<WsMailbox>()};
+
+    WebSocketSender websocket_sender(int fd, std::uint64_t id) {
+        std::weak_ptr<WsMailbox> weak=ws_mailbox_;
+        auto post=[weak,fd,id](std::string text,bool closing) -> bool {
+            auto mailbox=weak.lock(); if(!mailbox || text.size()>16384) return false;
+            std::lock_guard lock(mailbox->mutex);
+            if(mailbox->wake_fd<0 || mailbox->commands.size()>=4096) return false;
+            mailbox->commands.push_back({fd,id,std::move(text),closing});
+            std::uint64_t signal=1;
+            while(::write(mailbox->wake_fd,&signal,sizeof(signal))<0 && errno==EINTR) {}
+            return true;
+        };
+        return {[post](std::string text){return post(std::move(text),false);},[post](){post({},true);}};
+    }
+
+    void drain_websocket_commands() {
+        std::deque<WsCommand> commands;
+        { std::lock_guard lock(ws_mailbox_->mutex); commands.swap(ws_mailbox_->commands); }
+        for(auto& command:commands) {
+            auto it=connections_.find(command.fd);
+            if(it==connections_.end() || it->second->id!=command.id || !it->second->ws_session) continue;
+            auto* connection=it->second.get();
+            try {
+                if(command.closing) connection->ws_session->close(websocket::CloseCode::PolicyViolation,"Access changed");
+                else connection->ws_session->send_text(command.text);
+            } catch(...) { connection->ws_abort=true; }
+            // Reads and writes share one SQE slot. Interrupt the idle read so
+            // unsolicited pushes can flush without waiting for client traffic.
+            if(connection->pending && connection->pending->operation==OperationType::Read) {
+                if(!connection->cancel_requested && request_cancel(connection->pending)) {
+                    connection->ws_read_interrupted=true;
+                    connection->cancel_requested=true;
+                }
+            } else if(!connection->pending) process_websocket_input(connection);
+        }
+    }
 
     std::mutex completion_mutex_;
     std::deque<HandlerCompletion> handler_completions_;
@@ -632,6 +686,7 @@ private:
         connection->closed = true;
         remove_deadline(*connection);
         ::close(connection->fd);
+        if (connection->ws_session) connection->ws_session->transport_closed();
         connections_.erase(connection->fd);
         if (global_connections_)
             global_connections_->fetch_sub(1, std::memory_order_relaxed);
@@ -748,7 +803,7 @@ private:
                                    int fd,
                                    std::uint64_t connection_id,
                                    bool suppress_body,
-                                   bool base_close) {
+                                   bool base_close, std::shared_ptr<void> lifetime) {
         HandlerCompletion completion;
         completion.fd = fd;
         completion.connection_id = connection_id;
@@ -763,6 +818,7 @@ private:
             HttpParser::set_body(request, std::string_view(raw_request).substr(
                 header_size, request.content_length));
 
+            request.admission_lifetime = lifetime;
             const HandlerRoute* route = nullptr;
             if (!router_ || !router_->match(request, route)) {
                 completion.response.status(404).text("Not Found");
@@ -774,6 +830,7 @@ private:
             completion.response.status(500).text("Internal Server Error");
             completion.handler_failed = true;
         }
+        completion.response.resource_lifetime = std::move(lifetime);
         post_handler_completion(std::move(completion));
     }
 
@@ -796,9 +853,9 @@ private:
         const std::uint64_t connection_id = connection->id;
         const bool accepted = executor->submit(
             [this, raw = std::move(raw_request), fd, connection_id,
-             suppress_body, base_close]() mutable {
+             suppress_body, base_close, lifetime = connection->admission_lifetime]() mutable {
                 execute_offloaded_request(std::move(raw), fd, connection_id,
-                                          suppress_body, base_close);
+                                          suppress_body, base_close, std::move(lifetime));
             });
         if (!accepted) {
             --handler_jobs_;
@@ -858,6 +915,15 @@ private:
         try {
             HttpRequest request = HttpParser::parse_headers(
                 available.substr(0, header_size), limits_);
+            if (!connection->admission_checked) {
+                connection->admission_checked = true;
+                if (limits_.request_admission) {
+                    auto admission = limits_.request_admission(request);
+                    if (admission.status) { send_error(connection, admission.status); return; }
+                    connection->admission_lifetime = std::move(admission.lifetime);
+                }
+            }
+            request.admission_lifetime = connection->admission_lifetime;
             const std::size_t request_size = header_size + request.content_length;
             if (available.size() < request_size) {
                 if (!queue_read(connection)) close_connection(connection);
@@ -868,15 +934,19 @@ private:
 
             // WebSocket Upgrade Detection
             const WebSocketConfig* ws_config = router_ ? router_->find_ws(request.path) : nullptr;
-            if (ws_config && websocket::is_upgrade_request(request)) {
+            if (ws_config) {
                 HttpResponse ws_response;
-                if (websocket::make_upgrade_response(request, ws_response)) {
+                const int status = websocket::prepare_upgrade_response(request, ws_response, *ws_config);
+                if (status == 101 && !shutting_down_) {
+                    connection->ws_upgrade_request.assign(available.substr(0,header_size));
                     connection->is_websocket_upgrade = true;
                     connection->active_ws_config = ws_config;
                     connection->read_position += request_size;
                     begin_response(connection, ws_response, false, false);
                     return;
                 }
+                send_error(connection, status == 101 ? 503 : status);
+                return;
             }
 
             HttpResponse response;
@@ -933,56 +1003,76 @@ private:
         connection->response_headers.clear();
         connection->owned_body.clear();
         connection->response_body = {};
-        connection->write_offset = 0;
-        connection->write_size = 0;
+        connection->write_offset = connection->write_size = 0;
+        connection->read_deadline = std::chrono::steady_clock::now() +
+                                    connection->active_ws_config->read_timeout;
 
         const int fd = connection->fd;
+        const auto id = connection->id;
         connection->ws_session = std::make_shared<websocket::WebSocketSession>(
-            connection->active_ws_config ? *connection->active_ws_config : WebSocketConfig{},
-            [this, fd](std::string frame) {
+            *connection->active_ws_config,
+            [this, fd, id](std::string frame) {
                 auto it = connections_.find(fd);
-                if (it != connections_.end() && !it->second->closed) {
-                    it->second->ws_write_queue.push_back(std::move(frame));
-                    flush_websocket_writes(it->second.get());
+                if (it == connections_.end() || it->second->id != id || it->second->closed) return;
+                auto& c = *it->second;
+                const auto& config = *c.active_ws_config;
+                if (c.ws_abort) return;
+                if (frame.size() > config.max_pending_write_bytes - c.ws_pending_write_bytes ||
+                    c.ws_write_queue.size() + (c.ws_writing ? 1 : 0) >= config.max_pending_write_frames) {
+                    c.ws_abort = true;
+                    return;
                 }
+                c.ws_pending_write_bytes += frame.size();
+                c.ws_write_queue.push_back(std::move(frame));
+                // Defer I/O until the session callback returns. Closing or
+                // erasing connection state from inside feed would invalidate it.
             },
-            [this, fd](websocket::CloseCode, std::string_view) {
+            [this, fd, id](websocket::CloseCode, std::string_view) {
                 auto it = connections_.find(fd);
-                if (it != connections_.end() && !it->second->closed) {
-                    if (it->second->ws_write_queue.empty() && !it->second->ws_writing) {
-                        close_connection(it->second.get());
-                    } else {
-                        it->second->close_after_write = true;
-                    }
+                if (it == connections_.end() || it->second->id != id || it->second->closed) return;
+                auto& c = *it->second;
+                if (!c.ws_close_deadline_armed) {
+                    c.ws_close_deadline_armed = true;
+                    c.read_deadline = std::chrono::steady_clock::now() + c.active_ws_config->close_timeout;
                 }
-            }
+                c.close_after_write = c.ws_session->should_close_transport();
+            }, websocket_sender(fd,id)
         );
-
-        connection->ws_session->on_open();
+        try {
+            auto request=HttpParser::parse_headers(connection->ws_upgrade_request,limits_);
+            connection->ws_session->on_open(request);
+            connection->ws_upgrade_request.clear();
+        }
+        catch (...) { close_connection(connection); return; }
         process_websocket_input(connection);
     }
 
     void process_websocket_input(ConnectionState* connection) {
         if (!connection || connection->closed || !connection->ws_session) return;
-
-        if (connection->available_input() > 0) {
-            std::string unconsumed(connection->input_view());
-            connection->input.clear();
-            connection->read_position = 0;
-            connection->ws_session->feed(unconsumed);
-        }
-
-        if (!connection->closed && connection->ws_session->is_open() && !connection->pending) {
-            if (!queue_read(connection)) {
-                close_connection(connection);
+        try {
+            if (connection->available_input() > 0) {
+                std::string unconsumed(connection->input_view());
+                connection->input.clear();
+                connection->read_position = 0;
+                connection->ws_session->feed(unconsumed);
             }
+        } catch (...) { close_connection(connection); return; }
+        if (connection->ws_abort) { close_connection(connection); return; }
+        if (!connection->ws_close_deadline_armed && !connection->ws_session->has_pending_input())
+            connection->read_deadline = std::chrono::steady_clock::now() + connection->active_ws_config->read_timeout;
+        if (!connection->ws_write_queue.empty()) {
+            flush_websocket_writes(connection);
+            return;
+        }
+        if (connection->ws_session->should_close_transport()) { close_connection(connection); return; }
+        if (!connection->pending && connection->ws_session->is_readable()) {
+            set_deadline(connection, OperationType::Read, connection->read_deadline);
+            if (!queue_read(connection)) close_connection(connection);
         }
     }
 
     void flush_websocket_writes(ConnectionState* connection) {
-        if (!connection || connection->closed || connection->ws_writing ||
-            connection->ws_write_queue.empty() || connection->pending) return;
-
+        if (connection->ws_writing || connection->ws_write_queue.empty() || connection->pending) return;
         connection->ws_writing = true;
         connection->response_headers = std::move(connection->ws_write_queue.front());
         connection->ws_write_queue.pop_front();
@@ -990,12 +1080,10 @@ private:
         connection->owned_body.clear();
         connection->write_offset = 0;
         connection->write_size = connection->response_headers.size();
-
-        connection->write_deadline = std::chrono::steady_clock::now() + limits_.write_timeout;
+        connection->write_deadline = std::min(connection->read_deadline,
+            std::chrono::steady_clock::now() + limits_.write_timeout);
         set_deadline(connection, OperationType::Write, connection->write_deadline);
-        if (!queue_write(connection)) {
-            close_connection(connection);
-        }
+        if (!queue_write(connection)) close_connection(connection);
     }
 
     void admit_connection(int fd) {
@@ -1063,6 +1151,12 @@ private:
             case OperationType::Read: {
                 ConnectionState* connection = context->connection;
                 if (!connection || connection->closed) break;
+                if (result==-ECANCELED && connection->is_websocket && connection->ws_read_interrupted && !shutting_down_) {
+                    connection->ws_read_interrupted=false;
+                    process_websocket_input(connection);
+                    break;
+                }
+                connection->ws_read_interrupted=false;
                 if (result <= 0) {
                     close_connection(connection);
                     break;
@@ -1087,25 +1181,32 @@ private:
                 connection->write_offset += static_cast<std::size_t>(result);
                 if (connection->write_offset < connection->write_size) {
                     if (!queue_write(connection)) close_connection(connection);
+                } else if (connection->is_websocket) {
+                    connection->ws_pending_write_bytes -= connection->write_size;
+                    connection->ws_writing = false;
+                    connection->response_headers.clear();
+                    connection->write_offset = connection->write_size = 0;
+                    if (shutting_down_) {
+                        close_connection(connection);
+                    } else if (!connection->ws_write_queue.empty()) {
+                        flush_websocket_writes(connection);
+                    } else if (connection->ws_session->should_close_transport()) {
+                        close_connection(connection);
+                    } else if (!connection->pending && connection->ws_session->is_readable()) {
+                        set_deadline(connection, OperationType::Read, connection->read_deadline);
+                        if (!queue_read(connection)) close_connection(connection);
+                    }
                 } else if (connection->close_after_write || shutting_down_) {
                     close_connection(connection);
                 } else if (connection->is_websocket_upgrade) {
                     start_websocket(connection);
-                } else if (connection->is_websocket) {
-                    connection->ws_writing = false;
-                    connection->response_headers.clear();
-                    connection->write_offset = 0;
-                    connection->write_size = 0;
-                    if (!connection->ws_write_queue.empty()) {
-                        flush_websocket_writes(connection);
-                    } else if (connection->close_after_write) {
-                        close_connection(connection);
-                    } else if (!connection->pending && connection->ws_session && connection->ws_session->is_open()) {
-                        if (!queue_read(connection)) close_connection(connection);
-                    }
                 } else {
                     connection->response_headers.clear();
+                    const bool large_request = bool(connection->admission_lifetime);
                     connection->owned_body.clear();
+                    if (large_request) connection->owned_body.shrink_to_fit();
+                    connection->admission_lifetime.reset();
+                    connection->admission_checked = false;
                     connection->response_body = {};
                     connection->write_offset = 0;
                     connection->write_size = 0;
@@ -1114,6 +1215,7 @@ private:
                     set_deadline(connection, OperationType::Read,
                                  connection->read_deadline);
                     compact_input(*connection);
+                    if (large_request && connection->input.empty()) connection->input.shrink_to_fit();
                     if (connection->available_input() == 0) {
                         if (!queue_read(connection)) close_connection(connection);
                     } else {
@@ -1125,6 +1227,7 @@ private:
             case OperationType::Wake:
                 if (result >= 0) {
                     drain_handler_completions();
+                    drain_websocket_commands();
                 } else if (result != -ECANCELED) {
                     throw std::runtime_error("Handler wakeup poll failed: " +
                                              std::string(strerror(-result)));

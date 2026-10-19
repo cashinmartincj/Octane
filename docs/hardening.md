@@ -127,3 +127,28 @@ wrk -t8 -c128 -d30s --latency http://127.0.0.1:8080/
 - **Worker Allocation Sizing:** Start near the number of available physical CPU cores and measure. Excess workers add rings, listening sockets, memory, and scheduler contention.
 - **Kernel and Limit Sizing:** Validate the deployed kernel's multishot-accept behavior, file-descriptor limits, memory budget, and `io_uring` policy. The implementation falls back to single-shot accept, but it cannot bypass a policy that disables `io_uring` entirely.
 - **Blocking Work:** Keep filesystem, database, DNS, and CPU-heavy operations off ring threads unless their latency is strictly bounded.
+
+
+## WebSocket boundaries
+
+WebSocket upgrades use a separate route table and pre-upgrade authorization
+hook. Browser Origin values are denied unless explicitly allowlisted. HTTP
+route middleware does not automatically protect WebSocket routes. The framing
+implementation follows [RFC 6455](https://www.rfc-editor.org/rfc/rfc6455): masking,
+reserved flags/opcodes, canonical lengths, control-frame size/FIN, fragmentation,
+UTF-8 text, and close payloads are validated. Headers advertising oversized
+messages are rejected before payload allocation; output bytes/frame counts and
+read/write/close deadlines are bounded. No extensions are negotiated.
+
+Callbacks run on the owning worker, borrowed views/references cannot be retained,
+and exceptions are contained. Epoll session callbacks hold weak connection
+references so disconnects do not leave an ownership cycle. The io_uring transport
+defers frame writes and teardown until callbacks return, keeping connection and
+completion storage alive. Both transports drain Close responses and notify
+application closure once, including EOF and deadlines.
+
+The `websocket_tests` and `websocket_transport` regressions cover malformed and
+coalesced handshakes/frames, origin/authentication denials, split Unicode messages,
+control frames, oversized headers, callback failures, close handshakes, slow
+trickles, queue exhaustion, repeated disconnects, and active-connection shutdown.
+See [usage](usage.md#12-websocket-routes) for defaults and proxy configuration.

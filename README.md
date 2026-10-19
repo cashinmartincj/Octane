@@ -40,6 +40,7 @@ Performance needs to be measured for your workload. See the transport limits, su
 - **Zero-copy static file serving** via virtual memory `mmap`.
 - **POST/PUT/PATCH body parsing** via two-phase Content-Length reads.
 - **Compact route registration** through CRTP classes or plain handlers.
+- **WebSocket routes** on both transports with protocol validation, explicit browser origin allowlists, a pre-upgrade authorization hook, and bounded input/output and deadlines. See [WebSocket usage](docs/usage.md#12-websocket-routes).
 
 ---
 

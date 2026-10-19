@@ -400,7 +400,7 @@ Content-Length. In particular:
 - `Expect: 100-continue` is rejected with 417;
 - duplicate Content-Length fields are rejected, even when identical;
 - only origin-form targets and `OPTIONS *` are supported;
-- HTTP/2, HTTP/3, WebSocket upgrades, TLS termination, compression, multipart
+- HTTP/2, HTTP/3, TLS termination, compression, multipart
   decoding, and a JSON parser are not framework features;
 - the framework does not cap application response size;
 - authentication, authorization, CORS, persistence, logging, metrics, tracing,
@@ -494,3 +494,98 @@ claim.
 - Binding to `0.0.0.0` on a host where the origin port is publicly reachable.
 - Trusting forwarding headers when clients can bypass the trusted proxy.
 - Expecting the framework to decode chunked request bodies.
+
+
+## 12. WebSocket routes
+
+Both transports support HTTP/1.1 WebSocket upgrades, text/binary messages,
+fragmentation, Ping/Pong, and bounded closing handshakes. Compression and other
+WebSocket extensions are not negotiated. Invalid flags, opcodes, lengths,
+unmasked client frames, fragmentation sequences, text UTF-8, and Close payloads
+are rejected with a protocol Close. Oversized messages are rejected as soon as
+their frame header is available, before buffering the advertised payload.
+
+```cpp
+octane::WebSocketConfig ws;
+ws.allowed_origins = {"https://app.example.com"};
+ws.require_origin = true; // Require Origin on this browser-only endpoint.
+ws.max_payload_bytes = 64 * 1024;
+ws.max_pending_write_bytes = 256 * 1024;
+ws.max_pending_write_frames = 64;
+ws.read_timeout = std::chrono::seconds(60);
+ws.close_timeout = std::chrono::seconds(5);
+ws.authorize = [](const octane::HttpRequest& request) {
+    // Verify the application's session and permission for this endpoint.
+    return authenticate_websocket_session(request);
+};
+ws.on_message = [](octane::WebSocket& socket, std::string_view message, bool binary) {
+    if (binary) socket.send_binary(message);
+    else socket.send_text(message);
+};
+app.ws("/ws", std::move(ws));
+```
+
+`authorize` runs inline before the upgrade, with the complete HTTP request,
+and must return true to accept the connection. A false result returns 403;
+an exception returns 500 without exposing exception text. WebSocket routes
+have a separate upgrade path: existing HTTP route middleware is not invoked
+automatically. Protected routes must provide their own authorization check.
+Origin checks protect browser sessions but do not authenticate non-browser
+clients, which can supply arbitrary Origin headers.
+
+Every supplied Origin must exactly match `allowed_origins`; the default empty
+allowlist rejects browser origins. Missing Origin is permitted by default for
+non-browser clients. Set `require_origin` for endpoints that require it. There
+is no wildcard matching or implicit trust of Host/forwarding headers. Malformed
+handshakes and duplicate security/framing headers return 400 and close. Requests
+must use GET, HTTP/1.1, a nonempty Host, version 13, a valid 16-byte Base64 key,
+and a persistent connection with no request body.
+
+Default message limit is 16 MiB. Pending output is bounded to 16 MiB + 14 bytes
+and 256 frames, including the active write. Queue exhaustion closes the socket
+rather than allocating more output. A slow write expires using
+`HttpLimits::write_timeout`. `read_timeout` (default 60 seconds) bounds idle
+connections and incomplete messages: trickling bytes or interleaving Ping
+inside a fragmented message does not extend that deadline. Complete messages
+permit a fresh read deadline. All configured limits/timeouts must be positive.
+Limits are per connection; size connection capacity for the available memory.
+
+Calling `close()` sends Close and waits up to `close_timeout` (default 5 seconds)
+for the peer. Incoming Close is acknowledged, pending output drains within the
+closing deadline, and then the TCP connection closes. `on_close` fires once,
+including abnormal disconnects/timeouts (code 1006). Empty peer Close is reported
+as 1005, without sending that reserved code on the wire. Outbound control frames,
+close reasons/codes, text UTF-8, and message sizes are validated. Exceptions in
+open/message/Ping/Pong callbacks close the session with 1011; error and close
+callback exceptions are contained.
+
+Use `WebSocket` only during its own connection's callbacks, on its owning worker.
+Do not retain the reference/pointer, call it from another connection or thread,
+or retain callback payload views. Copy payloads before storing them. Callback
+handlers must not block. Cross-connection broadcast and asynchronous application
+push need a separate worker-owned lifetime/dispatch API and are not provided.
+
+Terminate TLS at a trusted edge. To proxy a WebSocket route through NGINX, add
+an explicit location for the registered path (the normal HTTP location clears
+Connection and cannot perform an upgrade):
+
+```nginx
+location = /ws {
+    proxy_pass http://octane_origin;
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "upgrade";
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_buffering off;
+    proxy_read_timeout 65s;
+    proxy_send_timeout 10s;
+}
+```
+
+Run the adversarial TCP tests against each backend explicitly:
+
+```bash
+OCTANE_TRANSPORT=epoll ctest --test-dir build --output-on-failure -R websocket
+OCTANE_TRANSPORT=io_uring ctest --test-dir build --output-on-failure -R websocket
+```

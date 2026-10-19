@@ -28,10 +28,12 @@
 
 #pragma once
 #include <string>
+#include <memory>
 #include <string_view>
 #include <unordered_map>
 #include <stdexcept>
 #include <utility>
+#include <vector>
 #include "HttpTypes.h"
 
 namespace octane
@@ -111,6 +113,7 @@ namespace octane
      * @endcode
      */
     struct HttpResponse {
+    std::shared_ptr<void> resource_lifetime;
         /// HTTP status code (default: 200 OK)
         int         status_code  = 200;
 
@@ -119,6 +122,8 @@ namespace octane
         
         /// Key-value map of custom response headers
         std::unordered_map<std::string, std::string> headers;
+        // Set-Cookie cannot be comma-folded or replaced when clearing other sessions.
+        std::vector<std::string> additional_cookies;
 
         /**
          * @enum BodyType
@@ -310,6 +315,10 @@ namespace octane
                 response.append(key).append(": ").append(val).append("\r\n");
             }
             
+            for (const auto& cookie : additional_cookies) {
+                if (!valid_header_value(cookie)) throw std::invalid_argument("Invalid cookie header");
+                response.append("Set-Cookie: ").append(cookie).append("\r\n");
+            }
             response.append("\r\n");
             return response;
         }

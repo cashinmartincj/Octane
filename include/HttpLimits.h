@@ -23,6 +23,8 @@
  */
 
 #include <chrono>
+#include <functional>
+#include <memory>
 #include <cstddef>
 #include <limits>
 #include <stdexcept>
@@ -39,6 +41,8 @@ namespace octane {
  * Note: These settings cap per-request ingress buffers; they do not restrict application heap
  * allocations or downstream database buffer limits.
  */
+struct HttpRequest;
+struct RequestAdmission { int status{0}; std::shared_ptr<void> lifetime; };
 struct HttpLimits {
     /// Maximum allowable request-line and header size in bytes, including the final CRLF CRLF (default: 16 KiB).
     std::size_t max_header_bytes = 16 * 1024;
@@ -66,6 +70,9 @@ struct HttpLimits {
      * @throws std::invalid_argument If any timeout is non-positive, connection bounds are zero,
      * or size additions could trigger integer overflow.
      */
+    // Invoked after bounded headers, before body materialization/offload.
+    std::function<RequestAdmission(const HttpRequest&)> request_admission;
+
     void validate() const {
         if (max_header_bytes < 4 || max_body_bytes >
             std::numeric_limits<std::size_t>::max() - max_header_bytes ||
